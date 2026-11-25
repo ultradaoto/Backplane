@@ -36,12 +36,16 @@ pub struct PlotView {
     /// Pieces a cross-probe lights (chunk index, piece info index), and the canvas's focus for the keys.
     pub lit: Vec<(usize, usize)>, pub focus: Option<FocusHandle>,
     pub down: Option<(f32, f32)>, pub picked: Option<super::plot::Pick>, pub card: Option<super::plot::Card>,
-    /// The plot as last tessellated, and what it was made from: a paint of the same chunks at the same zoom and canvas size submits these
-    /// again, moved to where the camera is now, instead of tessellating every chunk (tens of ms on a real board) for a frame that only moved
-    /// the plot (a drag) or something else. `tess_ahead`: the plot is being tessellated around the camera off the window's thread.
-    pub tess: Option<(TessKey, std::rc::Rc<Vec<(Path<Pixels>, Hsla)>>)>, pub tess_ahead: std::rc::Rc<std::cell::Cell<bool>>,
-    /// What the probe lights, tessellated for that exact camera and those lit pieces (a hash of `lit`).
-    pub lit_tess: Option<(TessKey, u64, std::rc::Rc<Vec<(Path<Pixels>, Hsla)>>)>,
+    /// The plot as last tessellated, per chunk, and what it was made from: a paint of the same chunks at the same zoom and canvas size
+    /// composites these again in the layers' order (a layer toggle) instead of tessellating every chunk (tens of ms on a real board) for a
+    /// frame that only turned layers on or off, moved the plot (a drag) or dimmed one. `tess_ahead`: the plot is being tessellated around
+    /// the camera off the window's thread.
+    pub tess: Option<Geo>, pub tess_ahead: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The paint list last composited from `tess`, and the order it was composited for: a paint of the same layers submits these again,
+    /// moved to where the camera is now, instead of walking the chunks once more.
+    pub flat: Option<(Vec<(usize, u32)>, std::rc::Rc<Vec<(std::sync::Arc<Vec<Path<Pixels>>>, Hsla)>>)>,
+    /// What the probe lights, tessellated for that exact camera and those lit pieces (a hash of `lit`), and the chunk membership of the order it was lit under.
+    pub lit_tess: Option<(TessKey, u64, u64, std::rc::Rc<Vec<(Path<Pixels>, Hsla)>>)>,
     /// The search field while the Mech part picker is open.
     pub part_search: Option<Entity<super::composer::Composer>>,
     /// The Boards menu (viewers::boards), held on the Board/Schematic page's camera for every page that shows it.
@@ -56,17 +60,18 @@ pub struct PlotView {
     pub last_retry: Option<std::time::Instant>,
 }
 
-/// What a tessellated plot depends on: the frame's chunks (by identity), the order and fade they are drawn in, the zoom and the canvas's
-/// size; and where it was made: the camera's centre and the canvas's corner (`at`), and how far past the canvas its paths reach (`pad`, px).
+/// What the plot's geometry depends on: the frame's chunks (by identity), the zoom and the canvas's size; and where it was made: the
+/// camera's centre and the canvas's corner (`at`), and how far past the canvas its paths reach (`pad`, px). Not the layers: which chunks
+/// show, in which order, at which fade is the paint's business (`flat`), so a layer toggle re-composites and tessellates nothing.
 #[derive(Clone, PartialEq, Debug)]
-pub struct TessKey { chunks: Vec<usize>, order: Vec<(usize, u32)>, scale: u32, size: [u32; 2], at: [f32; 4], pad: f32 }
+pub struct TessKey { chunks: Vec<usize>, scale: u32, size: [u32; 2], at: [f32; 4], pad: f32 }
 impl TessKey {
-    pub fn of(chunks: &[std::sync::Arc<Chunk>], order: &[(usize, f32)], v: &View, b: Bounds<Pixels>, pad: f32) -> TessKey {
-        TessKey { chunks: chunks.iter().map(|c| std::sync::Arc::as_ptr(c) as usize).collect(), order: order.iter().map(|&(i, f)| (i, f.to_bits())).collect(), scale: v.scale.to_bits(),
+    pub fn of(chunks: &[std::sync::Arc<Chunk>], v: &View, b: Bounds<Pixels>, pad: f32) -> TessKey {
+        TessKey { chunks: chunks.iter().map(|c| std::sync::Arc::as_ptr(c) as usize).collect(), scale: v.scale.to_bits(),
             size: [f32::from(b.size.width).to_bits(), f32::from(b.size.height).to_bits()], at: [v.cx, v.cy, f32::from(b.origin.x), f32::from(b.origin.y)], pad }
     }
-    /// The same plot drawn the same way (chunks, order, fades, zoom, canvas size): only where the camera and the canvas are may differ.
-    pub fn same_plot(&self, o: &TessKey) -> bool { self.chunks == o.chunks && self.order == o.order && self.scale == o.scale && self.size == o.size }
+    /// The same plot drawn the same way (chunks, zoom, canvas size): only where the camera and the canvas are may differ.
+    pub fn same_plot(&self, o: &TessKey) -> bool { self.chunks == o.chunks && self.scale == o.scale && self.size == o.size }
     /// How far (px) the paths made for `self` are moved to be the paint `now` asks for, or None when they cannot be: another plot, zoom or
     /// canvas size, or the camera has gone further than they reach past the canvas.
     pub fn moved(&self, now: &TessKey) -> Option<(f32, f32)> {
@@ -76,36 +81,57 @@ impl TessKey {
         (d.0.abs() <= self.pad && d.1.abs() <= self.pad).then_some(d)
     }
 }
+/// The plot's geometry at one camera, one chunk at a time: chunk `i`'s paths (its colour unfaded; the fade is applied when the paint list is
+/// composited) and whether any of it was culled for lying outside the canvas and the `pad`. A chunk with nothing to draw is `None`.
+/// (`Arc`: the background tessellation hands the geometry to the window's thread.)
+pub struct Geo { pub key: TessKey, pub chunks: Vec<Option<(std::sync::Arc<Vec<Path<Pixels>>>, Hsla)>>, pub culled: bool }
+impl Geo {
+    /// Every chunk of the plot as paths, in the frame's chunk order (the paint walks them in the layers' order), culled to the canvas and
+    /// `pad` px around it. `culled` says whether anything lay outside: the plot then serves only the cameras `moved` allows; a plot that
+    /// fits whole serves the camera wherever it goes.
+    fn tessellate(chunks: &[std::sync::Arc<Chunk>], v: &View, o: Point<Pixels>, w: f32, h: f32, pad: f32, mut sp: Option<&mut [f32; 3]>) -> Geo {
+        let key = TessKey::of(chunks, v, Bounds::new(o, size(px(w), px(h))), pad);
+        let mut per: Vec<Option<(std::sync::Arc<Vec<Path<Pixels>>>, Hsla)>> = Vec::with_capacity(chunks.len());
+        let mut culled = false;
+        for c in chunks {
+            let (paths, out) = chunk_paths(c, v, o, w, h, pad, sp.as_deref_mut());
+            culled |= out;
+            per.push((!paths.is_empty()).then(|| (std::sync::Arc::new(paths), color(c, 1.0))));
+        }
+        Geo { key, chunks: per, culled }
+    }
+}
+/// The paint list for one layers' order: each shown chunk's paths with its fade applied, in the order (and last the lifted layer) the hub
+/// decided. Shares the geometry (`Arc`), so compositing a layer toggle copies no paths.
+fn composite(geo: &Geo, order: &[(usize, f32)]) -> Vec<(std::sync::Arc<Vec<Path<Pixels>>>, Hsla)> {
+    order.iter().filter_map(|&(i, factor)| {
+        let (paths, base) = geo.chunks.get(i).cloned().flatten()?;
+        Some((paths, Hsla { a: base.a * factor, ..base }))
+    }).collect()
+}
 /// How far past the canvas (px, each side) the plot is tessellated off the window's thread: a drag moves those paths until the camera has
 /// gone half of it, then the plot around the camera is made again, off the thread too.
 pub fn tess_pad(w: f32, h: f32) -> f32 { (w.max(h) * 0.5).clamp(200., 1200.) }
-/// Every chunk of the plot as paths, in the order and at the fades given, culled to the canvas and `pad` px around it.
-/// Also whether that is the whole plot (nothing lay outside): paths that then serve the camera wherever it goes at this zoom.
-fn tessellate(chunks: &[std::sync::Arc<Chunk>], order: &[(usize, f32)], v: &View, o: Point<Pixels>, w: f32, h: f32, pad: f32, mut sp: Option<&mut [f32; 3]>) -> (Vec<(Path<Pixels>, Hsla)>, bool) {
-    let mut out = Vec::new(); let mut culled = false;
-    for &(i, factor) in order { culled |= paint_chunk(&mut out, &chunks[i], factor, v, o, w, h, pad, sp.as_deref_mut()); }
-    (out, !culled)
-}
 /// The plot tessellated around where the camera is now, off the window's thread (one at a time): the paints that follow move its paths
 /// (`TessKey::moved`) instead of making them, so a drag costs the window's thread no tessellation.
-fn tess_ahead(this: &Entity<Backplane>, cx: &mut App, slot: usize, chunks: &[std::sync::Arc<Chunk>], order: &[(usize, f32)], v: View, b: Bounds<Pixels>) {
+fn tess_ahead(this: &Entity<Backplane>, cx: &mut App, slot: usize, chunks: &[std::sync::Arc<Chunk>], v: View, b: Bounds<Pixels>) {
     this.update(cx, |app, cx| {
         let pv = app.screens.pv(slot);
         let running = pv.tess_ahead.clone();
         if running.replace(true) { return }
         let source = pv.key.clone();
         let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
-        let pad = tess_pad(w, h); let mut key = TessKey::of(chunks, order, &v, b, pad);
-        let (chunks, order) = (chunks.to_vec(), order.to_vec());
+        let pad = tess_pad(w, h);
+        let chunks = chunks.to_vec();
         let owner = app.screens.plots.owner.clone();
         cx.spawn(async move |weak, cx| {
-            let (out, whole) = cx.background_executor().spawn(async move { tessellate(&chunks, &order, &v, b.origin, w, h, pad, None) }).await;
-            if whole { key.pad = f32::INFINITY; }
+            let geo = cx.background_executor().spawn(async move { Geo::tessellate(&chunks, &v, b.origin, w, h, pad, None) }).await;
+            let mut geo = geo; if !geo.culled { geo.key.pad = f32::INFINITY; }
             let _ = weak.update(cx, |app, cx| {
                 if !finish_tess(&running, app.screens.plots.owner == owner && app.screens.plots[slot].key == source) { return }
                 let pv = app.screens.pv(slot);
-                // (a plot, zoom or canvas that changed meanwhile: these paths are of the old one, and the paint on show keeps its own)
-                if pv.tess.as_ref().map_or(true, |t| t.0.same_plot(&key)) { pv.tess = Some((key, std::rc::Rc::new(out))); cx.notify(); }
+                // (a plot, zoom or canvas that changed meanwhile: this geometry is of the old one, and the paint on show keeps its own)
+                if pv.tess.as_ref().map_or(true, |t| t.key.same_plot(&geo.key)) { pv.tess = Some(geo); pv.flat = None; cx.notify(); }
             });
         }).detach();
     });
@@ -118,9 +144,10 @@ fn finish_tess(running: &std::cell::Cell<bool>, current: bool) -> bool {
 
 fn color(c: &Chunk, factor: f32) -> Hsla { let mut r = rgb(c.color); r.a = c.alpha * factor; r.into() }
 
-/// A chunk's stroke width in pixels: the hub's width is in micrometres on the capsule (radius = width / 2).
-/// Answers whether anything of the chunk was left out for lying outside the canvas and its `pad`.
-fn paint_chunk(out: &mut Vec<(Path<Pixels>, Hsla)>, c: &Chunk, factor: f32, v: &View, o: Point<Pixels>, w: f32, h: f32, pad: f32, mut sp: Option<&mut [f32; 3]>) -> bool {
+/// A chunk's geometry as paths in canvas pixels (its colour is the caller's: one chunk, one colour), and whether anything of it was culled
+/// for lying outside the canvas and `pad`. The chunk's stroke width is in micrometres on the capsule (radius = width / 2).
+fn chunk_paths(c: &Chunk, v: &View, o: Point<Pixels>, w: f32, h: f32, pad: f32, mut sp: Option<&mut [f32; 3]>) -> (Vec<Path<Pixels>>, bool) {
+    let mut out = Vec::new();
     let mut culled = false;
     // (script mode only) ms since the last lap, added to the culling/tessellation/submission split
     let mut t = sp.as_ref().map(|_| std::time::Instant::now());
@@ -155,8 +182,8 @@ fn paint_chunk(out: &mut Vec<(Path<Pixels>, Hsla)>, c: &Chunk, factor: f32, v: &
             if round_ends { circle(&mut dots, a.0, a.1); circle(&mut dots, b.0, b.1); any_dot = true; }
         }
         lap(0, &mut sp);
-        if any { if let Ok(path) = pb.build() { lap(1, &mut sp); out.push((path, color(c, factor))); } }
-        if any_dot { if let Ok(path) = dots.build() { lap(1, &mut sp); out.push((path, color(c, factor))); } }
+        if any { if let Ok(path) = pb.build() { lap(1, &mut sp); out.push(path); } }
+        if any_dot { if let Ok(path) = dots.build() { lap(1, &mut sp); out.push(path); } }
     }
     if !c.polys.is_empty() {
         let mut pb = PathBuilder::fill(); let mut any = false;
@@ -171,9 +198,9 @@ fn paint_chunk(out: &mut Vec<(Path<Pixels>, Hsla)>, c: &Chunk, factor: f32, v: &
             pb.close(); any = true;
         }
         lap(0, &mut sp);
-        if any { if let Ok(path) = pb.build() { lap(1, &mut sp); out.push((path, color(c, factor))); } }
+        if any { if let Ok(path) = pb.build() { lap(1, &mut sp); out.push(path); } }
     }
-    culled
+    (out, culled)
 }
 /// Whether the segment a-b may show on a canvas of w x h with `margin` px around it: not when both ends lie beyond the same side. (Each end
 /// alone was tested before: a long track across the canvas with both ends outside it was not drawn.)
@@ -254,7 +281,7 @@ pub fn lit_chunks(chunks: &[std::sync::Arc<Chunk>], order: &[(usize, f32)], lit:
 fn lit_paths(chunks: &[std::sync::Arc<Chunk>], order: &[(usize, f32)], lit: &[(usize, usize)], v: &View, o: Point<Pixels>, w: f32, h: f32, edge: Hsla) -> Vec<(Path<Pixels>, Hsla)> {
     let (ls, edges, dots) = lit_chunks(chunks, order, lit, 2.5 / v.scale);
     let mut out = Vec::new();
-    for l in &ls { paint_chunk(&mut out, l, 1.0, v, o, w, h, 0.0, None); }
+    for l in &ls { let (ps, _) = chunk_paths(l, v, o, w, h, 0.0, None); let col = color(l, 1.0); out.extend(ps.into_iter().map(|p| (p, col))); }
     let mut pb = PathBuilder::stroke(px(1.5)); let mut any = false;
     let seen = |x: f32, y: f32, m: f32| x >= -m && x <= w + m && y >= -m && y <= h + m;
     for e in &edges {
@@ -349,8 +376,9 @@ fn paint_lit(window: &mut Window, p: &super::plot::Pick, v: &View, o: Point<Pixe
     if p.kind == 1 {
         // a stroke (a track, a wire) is lit as itself, at its own width (never thinner than 2.5 px), round ended: no line down its middle
         let c = Chunk { color: 0xffe066, alpha: 1.0, r: p.r.max(1.25 / v.scale), caps: p.pts.windows(4).step_by(2).flat_map(|q| [q[0], q[1], q[2], q[3], p.r.max(1.25 / v.scale)]).collect(), ..Default::default() };
-        let mut out = Vec::new(); paint_chunk(&mut out, &c, 1.0, v, o, w, h, 0.0, None);
-        for (path, color) in out { window.paint_path(path, color); }
+        let (ps, _) = chunk_paths(&c, v, o, w, h, 0.0, None);
+        let col = color(&c, 1.0);
+        for path in ps { window.paint_path(path, col); }
         return
     }
     let mut pb = PathBuilder::stroke(px(2.5));
@@ -380,31 +408,48 @@ pub fn canvas_el(cx: &mut Context<Backplane>, slot: usize, focus: Option<FocusHa
         // the paths kept from an earlier paint are drawn again, moved by what the camera moved since (a drag tessellates nothing here);
         // none that fit (the first paint, a zoom, another plot or size): the canvas alone is tessellated now, as little as shows it, and
         // the plot around it off this thread, for the paints that follow
-        let mut key = TessKey::of(&chunks, &order, &v, b, 0.0);
+        // The geometry kept from an earlier paint serves this one if the chunks, zoom and canvas are the same (a layer toggle, a dim or a
+        // drag re-composite or move it, and tessellate nothing); none that fit (the first paint, a zoom, another plot or size): the canvas
+        // alone is tessellated now, as little as shows it, and the plot around it off this thread, for the paints that follow.
+        let key = TessKey::of(&chunks, &v, b, 0.0);
         let exact = key.clone(); // this very camera: what the probe's light is kept for
-        let (paths, moved) = match this.update(cx, |app, _| app.screens.pv(slot).tess.as_ref().and_then(|t| t.0.moved(&key).map(|d| (t.1.clone(), d, t.0.pad)))) {
-            Some((p, d, pad)) => { if d.0.abs().max(d.1.abs()) > pad * 0.5 || pad == 0.0 { tess_ahead(&this, cx, slot, &chunks, &order, v, b); } (p, d) }
+        let order_sig: Vec<(usize, u32)> = order.iter().map(|&(i, f)| (i, f.to_bits())).collect();
+        let (flat, moved) = match this.update(cx, |app, _| {
+            let pv = app.screens.pv(slot);
+            let geo = pv.tess.as_ref()?;
+            let d = geo.key.moved(&key)?;
+            let sig = order_sig.clone();
+            let cached = match pv.flat.as_ref() { Some((s, l)) if *s == sig => Some(l.clone()), _ => None };
+            let list = match cached {
+                Some(l) => l,
+                None => { let list = std::rc::Rc::new(composite(geo, &order)); pv.flat = Some((sig, list.clone())); list }
+            };
+            Some((list, d, geo.key.pad))
+        }) {
+            Some((flat, d, pad)) => { if d.0.abs().max(d.1.abs()) > pad * 0.5 || pad == 0.0 { tess_ahead(&this, cx, slot, &chunks, v, b); } (flat, d) }
             None => {
-                let (out, whole) = tessellate(&chunks, &order, &v, b.origin, w, h, 0.0, measure.then_some(&mut sp));
-                // (the whole plot is on the canvas: these paths serve wherever the camera goes, and none are made ahead)
-                if whole { key.pad = f32::INFINITY; }
-                let p = std::rc::Rc::new(out);
-                this.update(cx, |app, _| app.screens.pv(slot).tess = Some((key, p.clone())));
-                if !whole { tess_ahead(&this, cx, slot, &chunks, &order, v, b); }
-                (p, (0.0, 0.0))
+                let mut geo = Geo::tessellate(&chunks, &v, b.origin, w, h, 0.0, measure.then_some(&mut sp));
+                // (the whole plot is on the canvas: this geometry serves wherever the camera goes, and none is made ahead)
+                let was_culled = geo.culled;
+                if !was_culled { geo.key.pad = f32::INFINITY; }
+                let flat = { let f = std::rc::Rc::new(composite(&geo, &order)); this.update(cx, |app, _| { let pv = app.screens.pv(slot); pv.tess = Some(geo); pv.flat = Some((order_sig.clone(), f.clone())); f }) };
+                if was_culled { tess_ahead(&this, cx, slot, &chunks, v, b); }
+                (flat, (0.0, 0.0))
             }
         };
         let moved = point(px(moved.0), px(moved.1));
         window.with_content_mask(Some(ContentMask { bounds: b }), |window| {
             let t2 = measure.then(std::time::Instant::now);
-            for (path, color) in paths.iter() { window.paint_path_at(path, moved, *color); }
+            for (paths, color) in flat.iter() { for path in paths.iter() { window.paint_path_at(path, moved, *color); } }
             if let Some(t2) = t2 { sp[2] += t2.elapsed().as_secs_f32() * 1000.0; }
             if !probe.is_empty() {
                 // the probed net or part itself, over the rest dimmed (tessellated once a camera, as the plot is)
                 let stamp = { use std::hash::{Hash, Hasher}; let mut hs = std::collections::hash_map::DefaultHasher::new(); probe.hash(&mut hs); hs.finish() };
-                let lp = match this.update(cx, |app, _| app.screens.pv(slot).lit_tess.as_ref().filter(|t| t.0 == exact && t.1 == stamp).map(|t| t.2.clone())) {
+                // (the lit pieces are of the chunks the order shows: a layer hidden since they were made lights them no more)
+                let lit_sig = { use std::hash::{Hash, Hasher}; let mut hs = std::collections::hash_map::DefaultHasher::new(); order.iter().for_each(|&(i, _)| i.hash(&mut hs)); hs.finish() };
+                let lp = match this.update(cx, |app, _| app.screens.pv(slot).lit_tess.as_ref().filter(|t| t.0 == exact && t.1 == stamp && t.2 == lit_sig).map(|t| t.3.clone())) {
                     Some(p) => p,
-                    None => { let p = std::rc::Rc::new(lit_paths(&chunks, &order, &probe, &v, b.origin, w, h, edge)); this.update(cx, |app, _| app.screens.pv(slot).lit_tess = Some((exact.clone(), stamp, p.clone()))); p }
+                    None => { let p = std::rc::Rc::new(lit_paths(&chunks, &order, &probe, &v, b.origin, w, h, edge)); this.update(cx, |app, _| app.screens.pv(slot).lit_tess = Some((exact.clone(), stamp, lit_sig, p.clone()))); p }
                 };
                 if !lp.is_empty() { window.paint_quad(fill(b, dim)); for (path, color) in lp.iter() { window.paint_path(path.clone(), *color); } }
                 paint_marks(window, &chunks, &probe, &v, b.origin, w, h);
@@ -809,6 +854,7 @@ pub fn report_state(app: &mut Backplane) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::viewers::layers::Masks;
     use core::prelude::v1::test;
 
     #[test]
@@ -849,25 +895,93 @@ mod tests {
         assert!(plan_shown(&serde_json::json!({"open": "plan"})));
         for st in [serde_json::json!({"open": ""}), serde_json::json!({"open": "bom"}), serde_json::Value::Null] { assert!(!plan_shown(&st), "{st}"); }
     }
-    #[test] fn a_tessellated_plot_is_reused_only_for_the_same_chunks_order_zoom_and_canvas_size() {
+    #[test] fn the_geometry_survives_a_layer_change_and_is_remade_only_for_another_plot_zoom_or_canvas() {
         let a = std::sync::Arc::new(Chunk::default()); let b = std::sync::Arc::new(Chunk::default());
         let v = View { cx: 1., cy: 2., scale: 0.5 }; let bx = Bounds::new(point(px(10.), px(20.)), size(px(300.), px(200.)));
-        let k = TessKey::of(&[a.clone(), b.clone()], &[(0, 1.0), (1, 0.4)], &v, bx, 0.0);
-        let of = |cs: &[std::sync::Arc<Chunk>], order: &[(usize, f32)], v: &View, bx: Bounds<Pixels>| k.moved(&TessKey::of(cs, order, v, bx, 0.0));
-        assert_eq!(of(&[a.clone(), b.clone()], &[(0, 1.0), (1, 0.4)], &v, bx), Some((0.0, 0.0)), "the same paint");
-        assert_eq!(of(&[a.clone(), std::sync::Arc::new(Chunk::default())], &[(0, 1.0), (1, 0.4)], &v, bx), None, "a chunk replaced");
-        assert_eq!(of(&[a.clone(), b.clone()], &[(1, 1.0), (0, 0.4)], &v, bx), None, "another order");
-        assert_eq!(of(&[a.clone(), b.clone()], &[(0, 1.0), (1, 1.0)], &v, bx), None, "another fade");
-        assert_eq!(of(&[a.clone(), b.clone()], &[(0, 1.0), (1, 0.4)], &View { scale: 0.6, ..v }, bx), None, "zoomed");
-        assert_eq!(of(&[a.clone(), b.clone()], &[(0, 1.0), (1, 0.4)], &v, Bounds::new(point(px(10.), px(20.)), size(px(301.), px(200.)))), None, "resized");
-        assert_eq!(of(&[a, b], &[(0, 1.0), (1, 0.4)], &View { cx: 3., ..v }, bx), None, "moved, and these paths reach no further than the canvas");
+        let k = TessKey::of(&[a.clone(), b.clone()], &v, bx, 0.0);
+        let of = |cs: &[std::sync::Arc<Chunk>], v: &View, bx: Bounds<Pixels>| k.moved(&TessKey::of(cs, v, bx, 0.0));
+        // a layer toggle changes only the paint's order and fades: the geometry is the same plot at the same camera
+        assert_eq!(of(&[a.clone(), b.clone()], &v, bx), Some((0.0, 0.0)));
+        assert_eq!(of(&[a.clone(), b.clone()], &v, bx), Some((0.0, 0.0)), "another order or fade: still the same geometry");
+        assert_eq!(of(&[a.clone(), std::sync::Arc::new(Chunk::default())], &v, bx), None, "a chunk replaced");
+        assert_eq!(of(&[a.clone(), b.clone()], &View { scale: 0.6, ..v }, bx), None, "zoomed");
+        assert_eq!(of(&[a.clone(), b.clone()], &v, Bounds::new(point(px(10.), px(20.)), size(px(301.), px(200.)))), None, "resized");
+        assert_eq!(of(&[a, b], &View { cx: 3., ..v }, bx), None, "moved, and these paths reach no further than the canvas");
+    }
+    #[test] fn a_layer_toggle_recomposites_the_fade_and_order_and_copies_no_paths() {
+        let mk = |layer: u32, color: u32, alpha: f32| std::sync::Arc::new(Chunk { layer, color, alpha, caps: vec![0., 0., 100., 0., 0.5], ..Default::default() });
+        let copper = mk(0, 0xc83434, 1.0); let silk = mk(26, 0xb0b0b0, 0.9);
+        let chunks = [copper.clone(), silk.clone()];
+        let v = View { cx: 0., cy: 0., scale: 1.0 }; let b = Bounds::new(point(px(0.), px(0.)), size(px(500.), px(400.)));
+        let geo = Geo::tessellate(&chunks, &v, b.origin, 500., 400., 0.0, None);
+        // the masks as the hub sends them: silk dimmed, copper lifted
+        let order_all = crate::viewers::layers::plan(&[0, 26], &Masks::default());
+        let order_dim = crate::viewers::layers::plan(&[0, 26], &Masks { off: 0, dim: 1 << 26, lift: 0 });
+        let order_hidden = crate::viewers::layers::plan(&[0, 26], &Masks { off: 1 << 26, dim: 0, lift: crate::viewers::layers::NO_LIFT });
+        // a toggle keeps the geometry: the same key answers the same camera
+        assert!(geo.key.same_plot(&TessKey::of(&chunks, &v, b, 0.0)));
+        // everything shows, unfaded in the geometry
+        assert_eq!(geo.chunks.len(), 2);
+        let (paths, col) = geo.chunks[0].clone().unwrap();
+        assert_eq!(col.a, 1.0); assert_eq!(paths.len(), 1, "one stroke path for the chunk's capsules");
+        // the composite applies the fades: the dimmed silk at a quarter of its own alpha, the lifted copper last at full strength
+        let flat_all = composite(&geo, &order_all);
+        let flat_dim = composite(&geo, &order_dim);
+        assert_eq!(flat_all.len(), 2); assert_eq!(flat_dim.len(), 2);
+        assert_eq!(flat_all[0].1.a, 1.0);
+        assert!((flat_dim[0].1.a - 0.9 * 0.25).abs() < 1e-6, "the dimmed layer at a quarter of its own alpha");
+        assert!(std::sync::Arc::ptr_eq(&flat_dim[0].0, &flat_all[1].0), "the dimmed silk is the same allocation");
+        assert!((flat_dim[1].1.a - 1.0).abs() < 1e-6, "the lifted copper full, and last");
+        assert!(std::sync::Arc::ptr_eq(&flat_dim[1].0, &flat_all[0].0), "compositing copies no paths");
+        // a hidden layer is left out of the paint list
+        let flat_hidden = composite(&geo, &order_hidden);
+        assert_eq!(flat_hidden.len(), 1); assert_eq!(flat_hidden[0].0.as_ptr(), geo.chunks[0].as_ref().unwrap().0.as_ptr());
+        // a chunk with nothing to draw is None, and composites to nothing
+        let empty = [std::sync::Arc::new(Chunk { layer: 3, ..Default::default() })];
+        let geo_empty = Geo::tessellate(&empty, &v, b.origin, 500., 400., 0.0, None);
+        assert!(geo_empty.chunks[0].is_none());
+        assert!(composite(&geo_empty, &[(0, 1.0)]).is_empty());
+    }
+    #[test] fn the_geometry_of_the_whole_plot_is_remade_only_past_its_reach() {
+        // a chunk entirely outside the canvas culls: the geometry then serves only the cameras its pad covers
+        let far = std::sync::Arc::new(Chunk { layer: 0, caps: vec![1e7, 1e7, 1.1e7, 1e7, 10.], ..Default::default() });
+        let v = View { cx: 0., cy: 0., scale: 1.0 }; let b = Bounds::new(point(px(0.), px(0.)), size(px(500.), px(400.)));
+        let geo = Geo::tessellate(&[far], &v, b.origin, 500., 400., 0.0, None);
+        assert!(geo.culled, "something lay outside");
+        let near = std::sync::Arc::new(Chunk { layer: 0, caps: vec![10., 10., 100., 10., 10.], ..Default::default() });
+        let geo = Geo::tessellate(&[near], &v, b.origin, 500., 400., 0.0, None);
+        assert!(!geo.culled, "the whole plot is on the canvas");
+    }
+    #[test] fn tessellating_a_board_once_then_toggling_layers_costs_only_the_composite() {
+        // a board-sized stand-in: 24 chunks of tracks, vias and zone fills over 300 x 250 mm
+        let mut chunks: Vec<std::sync::Arc<Chunk>> = Vec::new();
+        for layer in [0u32, 1, 2, 26] {
+            for k in 0..6 {
+                let mut caps = Vec::new(); let mut polys = Vec::new();
+                for t in 0..400 { let x = (t * 731 + k * 97 + layer * 13) % 300_000; let y = (t * 617 + k * 211) % 250_000; caps.extend([x as f32, y as f32, (x + 900) as f32, y as f32, 60.]); }
+                polys.push(vec![0., 0., 290_000., 0., 290_000., 240_000., 0., 240_000.]);
+                chunks.push(std::sync::Arc::new(Chunk { layer, color: 0xc83434, alpha: 1.0, r: 60., caps, polys, ..Default::default() }));
+            }
+        }
+        let v = View { cx: 150_000., cy: 125_000., scale: 2.0 }; let b = Bounds::new(point(px(0.), px(0.)), size(px(1200.), px(900.)));
+        let t0 = std::time::Instant::now();
+        let geo = Geo::tessellate(&chunks, &v, b.origin, 1200., 900., 0.0, None);
+        let tess_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let layers = [0u32, 1, 2, 26];
+        let toggles = [Masks::default(), Masks { off: 1, dim: 0, lift: 255 }, Masks { off: 1 | 2, dim: 0, lift: 0 }, Masks { off: 0, dim: 1 << 26, lift: 2 }];
+        let t1 = std::time::Instant::now();
+        let mut n = 0;
+        for m in toggles.iter().cycle().take(64) { let order = crate::viewers::layers::plan(&layers, m); n += composite(&geo, &order).len(); }
+        let comp_ms = t1.elapsed().as_secs_f64() * 1e3 / 64.;
+        eprintln!("layer toggle on a 24-chunk board: tessellate {tess_ms:.1} ms once, composite {comp_ms:.3} ms a toggle ({n} paths over the runs)");
+        assert!(comp_ms < tess_ms / 10.0, "compositing a toggle should be far under tessellating ({comp_ms:.3} vs {tess_ms:.1} ms)");
     }
     #[test] fn a_drag_moves_the_kept_paths_until_the_camera_is_past_what_they_cover() {
         let a = std::sync::Arc::new(Chunk::default());
         let v = View { cx: 100., cy: 200., scale: 0.5 }; let bx = Bounds::new(point(px(10.), px(20.)), size(px(800.), px(600.)));
         assert_eq!(tess_pad(800., 600.), 400.0); assert_eq!(tess_pad(100., 80.), 200.0, "a small canvas still covers a short drag"); assert_eq!(tess_pad(5000., 900.), 1200.0);
-        let k = TessKey::of(&[a.clone()], &[(0, 1.0)], &v, bx, 400.0);
-        let at = |v: &View, bx: Bounds<Pixels>| k.moved(&TessKey::of(&[a.clone()], &[(0, 1.0)], v, bx, 0.0));
+        let k = TessKey::of(&[a.clone()], &v, bx, 400.0);
+        let at = |v: &View, bx: Bounds<Pixels>| k.moved(&TessKey::of(&[a.clone()], v, bx, 0.0));
         // the plot dragged 30 px right and 10 px down: the camera's centre goes the other way, 60 and 20 plot units at this zoom
         let dragged = v.pan(30., 10.);
         assert_eq!(at(&dragged, bx), Some((30.0, 10.0)), "the paths follow the pointer");
@@ -876,7 +990,7 @@ mod tests {
         assert_eq!(at(&v.pan(0., 500.), bx), None);
         // paths of the whole plot serve the camera wherever it goes
         let mut whole = k.clone(); whole.pad = f32::INFINITY;
-        assert_eq!(whole.moved(&TessKey::of(&[a.clone()], &[(0, 1.0)], &v.pan(0., 5000.), bx, 0.0)), Some((0.0, 5000.0)));
+        assert_eq!(whole.moved(&TessKey::of(&[a.clone()], &v.pan(0., 5000.), bx, 0.0)), Some((0.0, 5000.0)));
         // the canvas itself moved in the window (a pane beside it changed width by the same amount on both sides): the paths go with it
         assert_eq!(at(&v, Bounds::new(point(px(25.), px(20.)), size(px(800.), px(600.)))), Some((15.0, 0.0)));
         // and a moved plot is where a tessellation at the new camera would put it: a plot point's pixel is the same either way
