@@ -24,7 +24,7 @@ backplane
 
 ### Windows（x64、実験段階）
 
-[最新リリース](https://github.com/BackplaneWorks/Backplane/releases/latest)から `backplane-v<version>-windows-x64.zip` をダウンロードし、書き込み可能なフォルダーに全体を展開して `Backplane.exe` を開きます。`resources/` とほかの展開ファイルは隣に置いたままにしてください。ElectronアプリとBunハブのポータブル版で、WSLは不要です。シェルコマンドにはCygwinのツールが必要です。同梱されているランタイムを保持してください。ツールがない場合は、[Windowsセットアップスクリプト](scripts/setup-windows.ps1)でCygwinをインストールし、起動前にその `bin` ディレクトリを `PATH` に追加します。エージェントCLIのインストールとサインインは別途必要です。[プロバイダー設定スクリプト](scripts/install-windows-providers.ps1)でClaudeとCodexをインストールできます。
+[最新リリース](https://github.com/BackplaneWorks/Backplane/releases/latest)から `backplane-v<version>-windows-x64-native.zip` をダウンロードし、書き込み可能なフォルダーに全体を展開して `backplane-gpui.exe` を開きます。初回起動時に `%LOCALAPPDATA%\Backplane` へのインストールが提案され、インストール後はスタートメニューから Backplane を起動します。ハブのシェルコマンドは `sh` を使うため、Git for Windows が必要です。エージェントCLIのインストールとサインインは別途必要です。
 
 FreeCADと[Backplane KiCadランタイム](https://github.com/BackplaneWorks/Backplane_KiCad/releases)は別途インストールしてください。`BACKPLANE_FREECAD` に実際の `bin/FreeCADCmd.exe`（隣にGUI実行ファイルが必要）、`BACKPLANE_KICAD` にランタイムのルートまたは `bin/kicad-cli.exe` を指定し、Backplaneを再起動します。通常のKiCadには、必要なIPC機能の一部がありません。
 
