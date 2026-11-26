@@ -41,6 +41,12 @@ fn reason(c: &Value) -> String {
 }
 fn owner(th: &str) -> &str { th.strip_prefix("@sub:").unwrap_or(th) }
 
+/// The precision a committed batch's progress writes keep (seconds): the record's only reader works on a gap of minutes
+/// (liveness::DEFAULT_GAP, 1200) and its lock heartbeat renews at half a lease (default 10 minutes), so a record up to this stale
+/// says all either reads. A busy turn's every-second batches wrote a record a step — and one for every owner above it, none of
+/// which checked its own clock: a fifth of the person's log was these. The streamed path (`line`) keeps its five seconds.
+pub const PROGRESS_PRECISION: u64 = 30;
+
 fn live(st: &State, th: &str) -> liveness::Live { liveness::read(&st.get(&liveness::key(th), "")) }
 /// Watchdog.parent: who launched the thread, else the parent of its unfinished task
 fn parent(st: &State, th: &str) -> String {
@@ -99,14 +105,18 @@ fn progress_k(st: &State, now: u64, th: &str, reason: &str, out: &mut Vec<Value>
     }
     heartbeat(st, now, th, out); // B.Locks.heartbeat: the same step also renews the thread's lock leases
 }
-/// Watchdog.progress: the thread itself (if the clock moved or an episode is open), then up to four owners that are at work
-fn progress(st: &State, now: u64, th: &str, why: &str, out: &mut Vec<Value>) {
-    let l = live(st, th);
-    if now > l.last || l.nudged > 0 { progress_k(st, now, th, why, out); }
+/// Watchdog.progress: the thread itself (if its record is `precision` stale, or an episode is open), then up to four owners that are
+/// at work, each judged by its own record the same way (an owner whose clock is fresh says all its readers need without a rewrite).
+/// `moved`: the records this batch has written (the gate reads the state BEFORE the batch, so two of the batch's own outputs would
+/// each write otherwise); the first output's reason stands.
+fn progress(st: &State, now: u64, th: &str, why: &str, precision: u64, moved: &mut std::collections::HashSet<String>, out: &mut Vec<Value>) {
+    // a thread with no record yet (last 0) writes its first at once: the stall math of a running thread measured from epoch would nudge it on the first tick
+    let fresh = |t: &str| { let l = live(st, t); l.last == 0 || l.nudged > 0 || now >= l.last.saturating_add(precision) };
+    if !moved.contains(th) && fresh(th) { progress_k(st, now, th, why, out); moved.insert(th.to_string()); }
     let why = format!("owned thread {th}: {why}");
     let mut p = parent(st, th);
     for _ in 0..4 {
-        if !p.is_empty() && active(st, &p) { progress_k(st, now, &p, &why, out); }
+        if !p.is_empty() && active(st, &p) && !moved.contains(&p) && fresh(&p) { progress_k(st, now, &p, &why, out); moved.insert(p.clone()); }
         p = parent(st, &p);
     }
 }
@@ -114,14 +124,15 @@ fn progress(st: &State, now: u64, th: &str, why: &str, out: &mut Vec<Value>) {
 pub fn after(st: &State, now: u64, batch: &[Value]) -> Vec<Value> {
     let mut out = vec![];
     if batch.iter().any(|c| gstr(c, "$", "") == "SettingSet" && gstr(c, "key", "").starts_with("liveness.")) { return out }
+    let mut moved: std::collections::HashSet<String> = Default::default();
     for c in batch {
         if gstr(c, "$", "") == "AskClosed" {
             let th = st.asks.get(gstr(c, "id", "")).map(|a| a.0.clone()).unwrap_or_default();
-            if !th.is_empty() { progress_k(st, now, &th, "request resolved", &mut out); }
+            if !th.is_empty() { progress_k(st, now, &th, "request resolved", &mut out); } // an episode ends: written whatever the clock says
             continue;
         }
         let src = source(c);
-        if !src.is_empty() { progress(st, now, owner(&src), &reason(c), &mut out); }
+        if !src.is_empty() { progress(st, now, owner(&src), &reason(c), PROGRESS_PRECISION, &mut moved, &mut out); }
     }
     out
 }
@@ -163,8 +174,8 @@ pub fn line(st: &State, now: u64, th: &str, o: &Value) -> Vec<Value> {
     if !(line_is_output(o) || task) { return vec![] } // most lines are not output: no record is read for them
     let l = live(st, th);
     if !(now >= l.last.saturating_add(5) || l.nudged > 0) { return vec![] }
-    let mut out = vec![];
-    progress(st, now, th, "agent tool or stream output", &mut out);
+    let mut out = vec![]; let mut moved: std::collections::HashSet<String> = Default::default();
+    progress(st, now, th, "agent tool or stream output", 5, &mut moved, &mut out);
     out
 }
 
@@ -214,8 +225,38 @@ mod tests {
         let quiet = json!({"$":"ActivityLogged","thread":"t1","act":"g2","tone":"info","kind":"git","summary":"x","at":60});
         assert!(after(&st, 61, &[quiet]).is_empty(), "an info act is not output");
     }
-    #[test] fn streamed_output_moves_the_record_at_five_second_precision() {
-        let st = fold(&[BASE[0], BASE[1], BASE[3], r#"{"$":"SettingSet","key":"liveness.t1","value":"{\"last\":100,\"nudged\":0,\"stalled\":false,\"reported\":false,\"reason\":\"r\"}","at":100}"#]);
+    /// A committed batch's progress keeps a 30-second precision (the stall gap is 20 minutes): batches a few seconds apart write
+    /// nothing, one past the precision writes, and an open episode (nudged) ends at once. Two outputs of one batch write one record:
+    /// the first reason stands.
+    #[test] fn a_batchs_progress_is_written_at_thirty_second_precision_and_once_a_batch() {
+        let at = |s: u64| format!(r#"{{"$":"SettingSet","key":"liveness.t1","value":"{{\"last\":{s},\"nudged\":0,\"stalled\":false,\"reported\":false,\"reason\":\"r\"}}","at":{s}}}"#);
+        let st = fold(&[BASE[0], BASE[1], BASE[3], &at(100)]);
+        assert!(after(&st, 110, &[m("t1", "a1", "assistant", "x")]).is_empty(), "inside the precision");
+        assert!(after(&st, 129, &[m("t1", "a2", "assistant", "x")]).is_empty());
+        let ev = after(&st, 130, &[m("t1", "a3", "assistant", "x")]);
+        assert_eq!(ev.len(), 1); assert!(ev[0]["value"].as_str().unwrap().contains(r#""last":130"#));
+        let st2 = fold(&[BASE[0], BASE[1], BASE[3], r#"{"$":"SettingSet","key":"liveness.t1","value":"{\"last\":100,\"nudged\":101,\"stalled\":true,\"reported\":false,\"reason\":\"r\"}","at":100}"#]);
+        assert_eq!(after(&st2, 105, &[m("t1", "a1", "assistant", "x")]).len(), 1, "an open episode ends at once");
+        // two outputs of one batch: one record, the first output's reason
+        let st3 = fold(&[BASE[0], BASE[1], BASE[3]]);
+        let act = json!({"$":"ActivityLogged","thread":"t1","act":"g1","tone":"tool","kind":"Bash","summary":"ls","at":60});
+        let msg = m("t1", "a1", "assistant", "x");
+        let ev = after(&st3, 60, &[act, msg]);
+        assert_eq!(ev.iter().filter(|e| e["key"] == "liveness.t1").count(), 1);
+        assert!(ev[0]["value"].as_str().unwrap().contains("Bash: ls"), "the first output's reason stands");
+    }
+    /// An owner whose record is fresh is not rewritten with the child's progress: a subagent's every step used to move up to four
+    /// owners, none checking its own clock. One past the precision the owner moves again.
+    #[test] fn an_owner_with_a_fresh_record_is_not_rewritten() {
+        let owner_rec = r#"{"$":"SettingSet","key":"liveness.t2","value":"{\"last\":120,\"nudged\":0,\"stalled\":false,\"reported\":false,\"reason\":\"owned thread t1: agent output\"}","at":120}"#;
+        let st = fold(&[BASE[0], BASE[1], BASE[2], BASE[3], r#"{"$":"TaskDelegated","task":"k","parent":"t2","child":"t1","depth":1,"provider":"claude","model":"","at":3}"#, owner_rec]);
+        let ev = after(&st, 125, &[m("t1", "a1", "assistant", "x")]);
+        assert_eq!(ev.len(), 1, "the child moves, the owner's 5-second-old record does not: {ev:?}");
+        assert_eq!(ev[0]["key"], "liveness.t1");
+        let ev = after(&st, 155, &[m("t1", "a2", "assistant", "x")]);
+        assert_eq!(ev.iter().filter(|e| e["key"].as_str() == Some("liveness.t2")).count(), 1, "past the precision the owner moves again");
+    }
+    #[test] fn streamed_output_moves_the_record_at_five_second_precision() {        let st = fold(&[BASE[0], BASE[1], BASE[3], r#"{"$":"SettingSet","key":"liveness.t1","value":"{\"last\":100,\"nudged\":0,\"stalled\":false,\"reported\":false,\"reason\":\"r\"}","at":100}"#]);
         let text = json!({"type":"stream_event","event":{"delta":{"text":"hi"}}});
         assert!(line(&st, 104, "t1", &text).is_empty(), "inside five seconds");
         let ev = line(&st, 105, "t1", &text); assert_eq!(ev.len(), 1);

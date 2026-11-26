@@ -344,7 +344,7 @@ mod tests {
         let mut c = Core::new(); c.fold_line(P); c.fold_line(T);
         let derived = p.finish_boot(c, 2, 1000);
         assert_eq!(keys(&derived).into_iter().filter(|k| k != "autosettle.version").collect::<Vec<_>>(), vec!["liveness.t1".to_string(), "autosettle.quiet.t1".to_string(), "autosettle.output.t1".to_string()], "only the batch past line 2 derives");
-        let again = p.before_commit(4, vec![msg("t1", "a2", "assistant", 11)]);
+        let again = p.before_commit(4, vec![msg("t1", "a2", "assistant", 45)]); // (a message a precision past the first: its liveness record moves again)
         assert_eq!(again.len(), 4, "after boot the batch carries its own events");
     }
     #[test] fn a_failed_commit_asks_for_a_resync_and_buffers_until_it_is_done() {
