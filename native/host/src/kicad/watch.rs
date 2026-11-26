@@ -22,6 +22,9 @@ const IDENTITY: [f32; 12] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.];
 const KEPT: usize = 4; // sources no client watches are kept (plots included): Src.kept
 const VERSIONS_KEPT: usize = 8; // saved versions no view watches: Src.versions.kept
 const WAIT_TICKS: u32 = 7; // a view waiting for its project's first board or schematic looks for it about once a second
+/// A plot that took this long (ms) is written to the log with what it made: where a person's board takes a moment to appear, the log
+/// says whether the time went into reading, into geometry, or into the infos beside it. Quick plots say nothing (most saves).
+const SLOW_PLOT_MS: f64 = 25.0;
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Stamp { rev: String, ok: bool }
@@ -79,6 +82,14 @@ pub fn is_retryable_err(why: &str) -> bool {
     !["too large", "too big", "not found", "no such file", "does not exist", "unsupported", "permission denied"].iter().any(|p| low.contains(p))
 }
 pub fn key(kind: u32, root: &str, path: &str) -> String { format!("{kind}|{root}|{path}") }
+/// The line a plot read slower than SLOW_PLOT_MS writes (None when it was quick): how long it took and what it made, so a board that
+/// takes a moment in the person's hands says in their log whether the time went into the file, the geometry, or the infos beside it.
+pub fn slow_plot(file: &str, ms: f64, p: &Plot) -> Option<String> {
+    if !(ms >= SLOW_PLOT_MS) { return None }
+    let (geo, infos): (usize, usize) = (p.cs.iter().map(|c| c.d.len()).sum(), p.cs.iter().map(|c| c.info.len()).sum());
+    Some(format!("plot: {} {ms:.0} ms, {} chunks, {:.1} MB of geometry, {:.1} MB of infos",
+        file.rsplit(['\t', '\n']).next().unwrap_or(file), p.cs.len(), geo as f64 / 1048576.0, infos as f64 / 1048576.0))
+}
 /// An Altium board file (.PcbDoc, any case): read by altium/pcb.rs
 pub fn is_altium_board(p: &str) -> bool { p.to_ascii_lowercase().ends_with(".pcbdoc") }
 pub fn kind_of(name: &str) -> Option<u32> { Some(match name { "board" => 0, "schematic" => 1, "3d" => 2, "3d-bare" => 3, "3d-full" => 4, _ => return None }) }
@@ -641,6 +652,8 @@ impl Plots {
             }
             match (&plot, code) {
                 (Some(p), _) => {
+                    // what a slow read cost and what it made (SLOW_PLOT_MS): the person's log says where a board's seconds went
+                    if !solid3 { if let Some(line) = slow_plot(&file, t0.elapsed().as_secs_f64() * 1000.0, p) { eprintln!("{line}") } }
                     me.step_stream_end(&ky); // a STEP's streamed parts: the model replaces them, and no part of them comes after it
                     me.send_to(&hub, &ky, p, None); me.revision(&hub, &ky, None);
                     if let Some(plan) = parts.take() { me.start_parts(&hub, &ky, &file, before.rev.clone(), plan) }
@@ -1368,6 +1381,15 @@ mod tests {
         assert!(raw(&mut out).is_empty(), "nothing of the stream after its end (the model goes next)");
         assert!(plots.st.lock().unwrap().srcs[&ky].parts.is_empty(), "a later view is sent the model alone");
         let _ = std::fs::remove_dir_all(&home);
+    }
+    #[test] fn a_slow_plot_says_where_its_time_went() {
+        let chunk = |d: usize, info: &str| plot::Chunk { sig: 7, layer: 12, color: 1, alpha: 2, mode: 1, width: 3, d: vec![0; d], info: info.into() };
+        let p = Plot { cs: vec![chunk(1048576, "track;net=GND"), chunk(1048576, "track")], b: plot::Rect { x0: 0, y0: 0, x1: 1, y1: 1 }, thick: 1600,
+            solid: None, edge: plot::Rect { x0: 0, y0: 0, x1: 1, y1: 1 }, note: String::new(), warn: false };
+        let line = slow_plot("/p/rc-test.kicad_pcb", 163.4, &p).expect("a slow plot says so");
+        assert_eq!(line, "plot: /p/rc-test.kicad_pcb 163 ms, 2 chunks, 2.0 MB of geometry, 0.0 MB of infos");
+        assert_eq!(slow_plot("/p/b.kicad_pcb", 24.9, &p), None, "a quick plot says nothing");
+        assert!(slow_plot("git\tabc\t/p/b.kicad_pcb", 900.0, &p).unwrap().starts_with("plot: /p/b.kicad_pcb "), "a saved version names its file");
     }
     #[test] fn a_refine_box_is_snapped_out_to_a_power_of_two_so_near_views_share_it() {
         let b = focus_box([1960.0, 150.0, 10.0], 5.0);
