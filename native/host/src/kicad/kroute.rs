@@ -252,7 +252,10 @@ pub fn push_out(a: &[P], b: &[P]) -> Option<P> {
 // ---- the router ------------------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-pub struct Opts { pub width: f64, /** copper layers to route on (indices); empty: the layers the net's pads are on, then every signal layer */ pub layers: Vec<usize>, /** false: no vias */ pub vias: bool, /** a via size to use instead of the board's */ pub via: Option<(f64, f64)>, /** plane layers too (a track there costs three times its length where it cuts another net's pour) */ pub planes: bool }
+pub struct Opts { pub width: f64, /** copper layers to route on (indices); empty: the layers the net's pads are on, then every signal layer */ pub layers: Vec<usize>, /** false: no vias */ pub vias: bool, /** a via size to use instead of the board's */ pub via: Option<(f64, f64)>, /** plane layers too (a track there costs three times its length where it cuts another net's pour) */ pub planes: bool,
+    /// when the routing stops: what it routed by then is kept (kicad_edit's route `budget`, so a long job answers with its finished
+    /// copper inside the caller's tool limit instead of being killed whole). None: no budget.
+    pub deadline: Option<std::time::Instant> }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Routed { pub tracks: Vec<(P, P, usize)>, pub vias: Vec<(P, Span)>, pub length: f64 }
 
@@ -290,6 +293,7 @@ fn find(u: &mut Vec<usize>, mut i: usize) -> usize { while u[i] != i { u[i] = u[
 pub fn route_net(b: &mut Board, net: &str, o: &Opts) -> Result<Routed, (Routed, String)> {
     let mut out = Routed::default();
     for _ in 0..64 {
+        if o.deadline.map_or(false, |d| std::time::Instant::now() >= d) { return Err((out, "the time budget ran out (the copper routed is kept; ask again for the rest)".into())) }
         match step(b, net, o) { Ok(None) => return Ok(out), Err(e) => return Err((out, e)),
             Ok(Some(r)) => { for (a, z, l) in &r.tracks { b.items.push(Item { shape: Shape::Capsule(*a, *z, o.width / 2.0), layers: 1 << l, net: net.into(), kind: Kind::Track, of: Default::default(), smd: false }) }
                 for (p, s) in &r.vias { b.items.push(Item { shape: Shape::Circle(*p, s.size / 2.0), layers: (s.from..=s.to).fold(0, |m, i| m | 1 << i), net: net.into(), kind: Kind::Via, of: Default::default(), smd: false }) }
@@ -325,7 +329,10 @@ fn step(b: &Board, net: &str, o: &Opts) -> Result<Option<Routed>, String> {
     let rare: Vec<f32> = spans.iter().map(|s| if has_micro && s.ty != "VT_MICRO" && all_vias > 0 { 6.0 * (1.0 - s.n as f32 / all_vias as f32) } else { 0.0 }).collect();
     let bb = own.iter().map(|i| b.items[*i].shape.bbox()).fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |m, x| (m.0.min(x.0), m.1.min(x.1), m.2.max(x.2), m.3.max(x.3)));
     let mut last = String::new();
+    let out_of = |d: Option<std::time::Instant>| d.map_or(false, |d| std::time::Instant::now() >= d);
+    let mut timed_out = false;
     for margin in [1.5, 5.0] {
+        if timed_out || out_of(o.deadline) { timed_out = true; break }
         let (w, h) = (bb.2 - bb.0 + 2.0 * margin, bb.3 - bb.1 + 2.0 * margin);
         // a cell is a quarter of the track or finer; the whole search stays under 40 million states
         let mut g = (o.width / 8.0).clamp(0.0125, 0.025); let cap = 40e6 / (8.0 * route.count_ones() as f64); if w * h / (g * g) > cap { g = (w * h / cap).sqrt() }
@@ -374,13 +381,13 @@ fn step(b: &Board, net: &str, o: &Opts) -> Result<Option<Routed>, String> {
         // start: every free cell of the source group, as a move in no direction yet (kept as all eight directions at once)
         for l in 0..nl { if route & 1 << l == 0 { continue } for c in 0..n { let id = gr.own[l * n + c]; if id != 0 && roots[id as usize - 1] == src && gr.block[l * n + c] & TRACK == 0 {
             for d in 0..8 { let s = (l * n + c) * 8 + d; cost[s] = 0.0; heap.push(Node(est(gr.at(c)), s as u32)) } } } }
-        if heap.is_empty() { last = format!("{what}: the net's copper there has no room for a {} mm track at {clr} mm clearance", o.width); continue }
-        let (mut goal, mut pops) = (None, 0usize);
+        if heap.is_empty() { last = format!("{what}: the net's copper there has no room for a {} mm track at {clr} mm clearance", o.width); continue }        let (mut goal, mut pops) = (None, 0usize);
         while let Some(Node(f, s)) = heap.pop() {
             let s = s as usize; let (lc, d) = (s / 8, s % 8); let (l, c) = (lc / n, lc % n); let gc = cost[s];
             if f > gc + est(gr.at(c)) + 1e-3 { continue }
             let id = gr.own[lc]; if id != 0 && roots[id as usize - 1] != src { goal = Some(s); break }
             pops += 1; if pops > 8_000_000 { break }
+            if pops & 4095 == 0 && out_of(o.deadline) { timed_out = true; break }
             let (cx, cy) = ((c % gr.nx) as i32, (c / gr.nx) as i32);
             for (nd, (dx, dy)) in DIRS.iter().enumerate() {
                 let turn = { let t = (nd as i32 - d as i32).rem_euclid(8); t.min(8 - t) };
@@ -400,7 +407,8 @@ fn step(b: &Board, net: &str, o: &Opts) -> Result<Option<Routed>, String> {
                     // a via costs its detour's worth, more the more layers it drills through
                     let nc = gc + 1.0 + 0.4 * (sp.to - sp.from) as f32 + rare[si] + if sp.ty != "VT_MICRO" && gr.block[c] & COURT != 0 { 3.0 } else { 0.0 }; for nd in 0..8 { let s2 = (l2 * n + c) * 8 + nd; if nc < cost[s2] { cost[s2] = nc; from[s2] = s as u32; how[s2] = si as u8 + 1; heap.push(Node(nc + est(gr.at(c)), s2 as u32)) } } } }
         }
-        let Some(goal) = goal else { last = format!("{what}: no way for a {} mm track at {clr} mm clearance{}", o.width, if spans.is_empty() { " without vias" } else { "" }); continue };
+        let Some(goal) = goal else { last = if timed_out { format!("{what}: the time budget ran out before a way was found") }
+            else { format!("{what}: no way for a {} mm track at {clr} mm clearance{}", o.width, if spans.is_empty() { " without vias" } else { "" }) }; continue };
         // the way back, as (point, layer)
         let mut path: Vec<(P, usize)> = vec![]; let mut via_at: HashMap<usize, usize> = HashMap::new(); let mut s = goal;
         loop { let lc = s / 8; path.push((gr.at(lc % n), lc / n)); if how[s] != 0 { via_at.insert(path.len() - 1, how[s] as usize - 1); } if from[s] == u32::MAX { break } s = from[s] as usize }
@@ -515,7 +523,7 @@ mod tests {
     use super::*;
     fn pad(r: &str, n: &str, net: &str, c: P, hx: f64, hy: f64, deg: f64) -> Item { Item { shape: Shape::Rect(c, hx, hy, deg, 0.0), layers: 1, net: net.into(), kind: Kind::Pad, of: (r.into(), n.into()), smd: true } }
     fn board(items: Vec<Item>) -> Board { Board { layers: vec!["F.Cu".into(), "B.Cu".into()], items, min_clearance: 0.15, spans: vec![Span { from: 0, to: 1, ty: "VT_THROUGH".into(), size: 0.5, drill: 0.3, n: 1, like: Value::Null }], ..Default::default() } }
-    fn opts() -> Opts { Opts { width: 0.2, layers: vec![], vias: true, via: None, planes: false } }
+    fn opts() -> Opts { Opts { width: 0.2, layers: vec![], vias: true, via: None, planes: false, deadline: None } }
     /// every routed track keeps its clearance to every other net's copper (the model's own check, exact)
     fn clean(b: &Board, net: &str, r: &Routed, w: f64) -> bool {
         r.tracks.iter().all(|(a, z, l)| Shape::Capsule(*a, *z, 0.0).samples(0.01).iter().all(|p| b.items.iter().all(|it| it.net == net || it.layers & 1 << l == 0 || it.shape.dist(*p) >= w / 2.0 + 0.15 - 1e-6)))
@@ -554,6 +562,25 @@ mod tests {
         assert_eq!(r.vias.len(), 2, "{r:?}"); assert!(r.tracks.iter().any(|t| t.2 == 1)); assert!(clean(&b, "A", &r, 0.2));
         let e = route_net(&mut board(items), "A", &Opts { vias: false, ..opts() }).unwrap_err().1;
         assert!(e.contains("R1.1 and R2.1") && e.contains("without vias"), "{e}");
+    }
+    /// Route.budget: a deadline in the past stops the router at once with its word, one far off changes nothing, and a budget cut
+    /// mid-net keeps the copper the earlier connections routed (Err's first field, which kicad_edit commits).
+    #[test] fn a_budget_cut_stops_the_router_and_keeps_what_it_routed() {
+        let wall = Item { shape: Shape::Capsule(P(2.0, -30.0), P(2.0, 30.0), 0.1), layers: 1, net: "B".into(), kind: Kind::Track, of: Default::default(), smd: false };
+        let items = || vec![pad("R1", "1", "A", P(0.0, 0.0), 0.2, 0.2, 0.0), pad("R2", "1", "A", P(4.0, 0.0), 0.2, 0.2, 0.0), wall.clone()];
+        // out at once: the error says the budget, and nothing was routed
+        let e = route_net(&mut board(items()), "A", &Opts { deadline: Some(std::time::Instant::now()), ..opts() }).unwrap_err();
+        assert!(e.1.contains("budget"), "{e:?}"); assert!(e.0.tracks.is_empty() && e.0.vias.is_empty());
+        // a deadline far off: the same route as without one
+        let mut b = board(items());
+        let r = route_net(&mut b, "A", &Opts { deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)), ..opts() }).unwrap();
+        assert_eq!(r.vias.len(), 2, "{r:?}");
+        // out mid-net: the search stops, the error says the budget, and the copper routed before it (none of this net's first step) is kept
+        let mut b = board(items());
+        let e = route_net(&mut b, "A", &Opts { deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(1)), ..opts() }).unwrap_err();
+        assert!(e.1.contains("budget"), "{e:?}");
+        // (the copper routed stays in the Board too: a caller routes again on top of it)
+        assert!(b.items.iter().any(|it| it.net == "A" && it.kind == Kind::Track) || e.0.tracks.is_empty(), "either the board keeps it or nothing was routed yet");
     }
     #[test] fn the_boards_own_vias_and_straight_runs() {
         // nothing in the way: one diagonal and one straight track, not the grid's steps

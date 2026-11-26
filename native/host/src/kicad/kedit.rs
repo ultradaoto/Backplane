@@ -1111,19 +1111,37 @@ impl Run<'_> {
                 let ws: Vec<f64> = nets.iter().map(|n| width(n)).collect(); if let Some(k) = ws.iter().position(|w| *w <= 0.0) { return Err(format!("{} has no track width: give width", nets[k])) }
                 let wof: std::collections::HashMap<String, f64> = nets.iter().cloned().zip(ws).collect(); let copper = board.layers.clone();
                 let stands: Vec<kr::Item> = board.items.iter().filter(|i| matches!(i.kind, kr::Kind::Pad | kr::Kind::Via) && self.vacated.iter().any(|v| v.0 == i.net)).cloned().collect();
+                // the route's time budget (seconds; default 210, at most 300: the caller's tool limit is 300 and the call still has
+                // its reads and the save to do): when it runs out, the copper routed by then is committed and the rest named, so a
+                // long job is never lost whole (the 2026-11-23 run's first route call ran past the limit and saved nothing)
+                let budget = op["budget"].as_f64().unwrap_or(210.0).clamp(0.0, 300.0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(budget);
                 type Res = Vec<(String, Result<kr::Routed, (kr::Routed, String)>)>;
-                let (res, wof) = tokio::task::spawn_blocking(move || { let mut order = nets; let mut best: Option<Res> = None;
-                    let bad = |r: &Res| r.iter().filter(|x| x.1.is_err()).count();
-                    for _ in 0..4 { let mut b = board.clone();
+                let (res, wof, budgeted, unrouted) = tokio::task::spawn_blocking(move || { let mut order = nets; let all = order.clone();
+                    let mut best: Option<Res> = None; let mut budgeted = false; let mut attempted: std::collections::HashSet<String> = Default::default();
+                    let out_of = |d: Option<std::time::Instant>| d.map_or(false, |d| std::time::Instant::now() >= d);
+                    // how many nets a pass has routed, then how few it failed: a budget cut mid-pass keeps the most-routed attempt
+                    let score = |r: &Res| (r.iter().filter(|x| x.1.is_ok()).count(), std::cmp::Reverse(r.iter().filter(|x| x.1.is_err()).count()));
+                    'passes: for _ in 0..4 { let mut b = board.clone();
+                        let mut res: Res = vec![]; let mut cut = false;
                         // a net with no way on the signal layers is tried once more with the plane layers too
-                        let res: Res = order.iter().map(|n| { let snap = b.clone(); let o = kr::Opts { width: wof[n], layers: layers.clone(), vias, via, planes: false };
-                            let r = match kr::route_net(&mut b, n, &o) { Err(_) if layers.is_empty() && b.planes != 0 => { b = snap; kr::route_net(&mut b, n, &kr::Opts { planes: true, ..o }) } r => r }; (n.clone(), r) }).collect();
-                        let n = bad(&res);
+                        for n in &order {
+                            if out_of(Some(deadline)) { cut = true; break }
+                            attempted.insert(n.clone());
+                            let snap = b.clone(); let o = kr::Opts { width: wof[n], layers: layers.clone(), vias, via, planes: false, deadline: Some(deadline) };
+                            let r = match kr::route_net(&mut b, n, &o) { Err(_) if layers.is_empty() && b.planes != 0 => { b = snap; kr::route_net(&mut b, n, &kr::Opts { planes: true, ..o }) } r => r };
+                            res.push((n.clone(), r));
+                            if out_of(Some(deadline)) { cut = true; break }
+                        }
+                        let n = res.iter().filter(|x| x.1.is_err()).count();
+                        let took = best.as_ref().map_or(true, |x| score(&res) > score(x));
                         let mut next: Vec<String> = res.iter().filter(|x| x.1.is_err()).map(|x| x.0.clone()).collect(); next.extend(res.iter().filter(|x| x.1.is_ok()).map(|x| x.0.clone()));
-                        if best.as_ref().map_or(true, |x| n < bad(x)) { best = Some(res) }
+                        if took { best = Some(res) }
+                        if cut { budgeted = true; break 'passes } // (the pass's routed nets went into best above)
                         if order.len() < 2 { break }
                         if n == 0 || next == order { break } order = next }
-                    (best.unwrap_or_default(), wof) }).await.map_err(|e| format!("the router stopped: {e}"))?;
+                    let unrouted: Vec<String> = all.into_iter().filter(|n| !attempted.contains(n)).collect();
+                    (best.unwrap_or_default(), wof, budgeted, unrouted) }).await.map_err(|e| format!("the router stopped: {e}"))?;
                 let (mut items, mut routed, mut failed) = (vec![], vec![], vec![]); self.touched.extend(wof.keys().cloned());
                 for (net, r) in res { let (r, why) = match r { Ok(r) => (r, None), Err((r, e)) => (r, Some(e)) };
                     for (a, z, l) in &r.tracks { items.push(json!({"@type": format!("{BT}Track"), "start": to_xy(a.0, a.1), "end": to_xy(z.0, z.1), "width": {"value_nm": nm(wof[&net])}, "layer": layer_enum(&copper[*l]), "net": {"name": net}})) }
@@ -1198,6 +1216,7 @@ impl Run<'_> {
                 // nets that were already whole are counted, not listed
                 let whole = routed.iter().filter(|r| r["length"] == 0.0).count(); routed.retain(|r| r["length"] != 0.0);
                 let mut out = json!({"routed": routed}); if ripped > 0 { out["ripped_up"] = json!(ripped) } if !crossing.is_empty() { out["rerouted_off_the_pads"] = json!(crossing) } if trimmed > 0 { out["old_stubs_trimmed"] = json!(trimmed) } if whole > 0 { out["already_connected"] = json!(whole) } if !failed.is_empty() { out["failed"] = json!(failed) }
+                if budgeted { out["budgeted"] = json!(true); if !unrouted.is_empty() { out["unrouted"] = json!(unrouted); out["note"] = json!("the time budget ran out: the nets in `unrouted` were not routed; the copper routed is kept and saved. Send the same op again for those nets (ripup: false keeps what is there).") } }
                 Ok(out)
             }
             "place" => {
@@ -1390,7 +1409,7 @@ mod tests {
     }
 
     /// A stand-in KiCad: a board with two footprints, a track and a zone; it records every command.
-    struct Fake { log: Mutex<Vec<(String, Value)>>, open: Mutex<bool>, fail: Option<&'static str>, busy: Mutex<u32>, save: Value, texts: Option<Vec<String>>, caps: Vec<String>, served: Option<&'static str>, zones: Option<Value>, libs: Option<Mutex<Libs>> }
+    struct Fake { log: Mutex<Vec<(String, Value)>>, open: Mutex<bool>, fail: Option<&'static str>, busy: Mutex<u32>, save: Value, texts: Option<Vec<String>>, caps: Vec<String>, served: Option<&'static str>, zones: Option<Value>, libs: Option<Mutex<Libs>>, board_rules: bool }
     /// Footprint libraries loading as in the live editor (#1204's sibling, b5 Fix 1): each library's status before and from its poll `at`
     /// of GetLibraryStatuses, and the footprints it has; KiCad answers "not found" for a footprint until its library is LOADED.
     struct LibRow { kind: &'static str, nick: &'static str, before: &'static str, after: &'static str, at: u32, has: &'static [&'static str] }
@@ -1429,6 +1448,10 @@ mod tests {
                 "GetLibraryStatuses" if self.libs.is_some() => { let mut l = self.libs.as_ref().unwrap().lock().unwrap(); l.polls += 1; let p = l.polls;
                     json!({"libraries": l.rows.iter().map(|r| { let st = r.now(p); let mut e = json!({"entry": {"nickname": r.nick, "type": r.kind, "scope": "LTS_GLOBAL"}, "status": st}); if st == "LLS_ERROR" { e["error_message"] = json!("cannot read /x/A.pretty") } e }).collect::<Vec<_>>()}) }
                 "DeleteItems" => json!({"deleted_items": msg["item_ids"].as_array().unwrap().iter().map(|i| json!({"id": i, "status": "IDS_OK"})).collect::<Vec<_>>()}),
+                // a small board's own numbers, for the route op's model (two copper layers, 0.15 min clearance, 0.3 to the edge and the holes)
+                "GetBoardEnabledLayers" if self.board_rules => json!({"layers": ["BL_F_Cu", "BL_B_Cu"]}),
+                "GetBoardDesignRules" if self.board_rules => json!({"rules": {"constraints": {"min_clearance": {"value_nm": "150000"}, "copper_edge_clearance": {"value_nm": "300000"}, "hole_clearance": {"value_nm": "300000"}}}}),
+                "GetNetClassForNets" if self.board_rules => json!({"classes": {"GND": {"board": {"clearance": {"value_nm": "150000"}, "track_width": {"value_nm": "200000"}}}}}),
                 _ => json!({}),
             })
         }) }
@@ -1436,7 +1459,7 @@ mod tests {
         fn caps(&self) -> Vec<String> { self.caps.clone() }
         fn served(&self) -> Option<&'static str> { self.served }
     }
-    fn fake(fail: Option<&'static str>) -> Fake { Fake { log: Mutex::new(vec![]), open: Mutex::new(false), fail, busy: Mutex::new(0), save: json!({}), texts: None, caps: vec![], served: None, zones: None, libs: None } }
+    fn fake(fail: Option<&'static str>) -> Fake { Fake { log: Mutex::new(vec![]), open: Mutex::new(false), fail, busy: Mutex::new(0), save: json!({}), texts: None, caps: vec![], served: None, zones: None, libs: None, board_rules: false } }
     fn names(f: &Fake) -> Vec<String> { f.log.lock().unwrap().iter().map(|(t, _)| t.clone()).collect() }
     fn sent(f: &Fake, ty: &str) -> Value { f.log.lock().unwrap().iter().find(|(t, _)| t == ty).map(|(_, m)| m.clone()).unwrap_or(Value::Null) }
     fn go(f: &Fake, a: Value) -> Result<Value, String> { go_on(f, "/p/b.kicad_pcb", a) }
@@ -1776,6 +1799,19 @@ mod tests {
         assert_eq!((out["check"].clone(), *c.1.lock().unwrap()), (json!({"by": "KiCad's DRC of the saved board, schematic parity included", "new": [], "left": 1, "elsewhere": {"count": 1, "first": ["clearance: Track [GND]"], "note": "on items this edit did not work on: a refill or the file's first save moves such findings about; they are this edit's only if its copper cut a pour there"}}), 2), "R1 was moved: a finding that does not name R1 is set apart, not hidden");
         let c = Checked(fake(None), Mutex::new(0)); let out = rt().block_on(run(&c, "/p/b.kicad_pcb", &json!({"ops": [{"find": "footprint"}]}))).unwrap(); assert_eq!((out.get("check"), *c.1.lock().unwrap()), (None, 0));
         let c = Checked(fake(None), Mutex::new(0)); rt().block_on(run(&c, "/p/b.kicad_pcb", &json!({"ops": [{"move": "R1", "by": [1, 0]}], "check": false}))).unwrap(); assert_eq!(*c.1.lock().unwrap(), 0);
+    }
+    /// Route.budget: a long job answers with its finished copper instead of being killed whole (the 2026-11-23 run's first route call
+    /// ran past the tool limit and saved nothing). A budget of 0 is out at once, deterministically: the net is named `unrouted`, the
+    /// answer says `budgeted`, and nothing was created.
+    #[test] fn a_route_with_no_budget_left_names_its_nets_and_creates_nothing() {
+        let mut f = fake(None); f.board_rules = true;
+        let out = go(&f, json!({"ops": [{"route": "GND", "budget": 0}], "save": false})).unwrap();
+        let r = &out["results"][0];
+        assert_eq!(r["budgeted"], json!(true), "{out}");
+        assert_eq!(r["unrouted"], json!(["GND"]));
+        assert_eq!(r["routed"], json!([]));
+        assert!(r["note"].as_str().unwrap().contains("budget ran out"), "{}", r["note"]);
+        assert!(!names(&f).iter().any(|n| n == "BeginCommit" || n == "CreateItems" || n == "SaveDocument"), "a budget cut before the first net creates nothing: {:?}", names(&f));
     }
     #[test] fn raw_commands_run_in_order_with_the_document_filled_in() {
         let f = fake(None);
