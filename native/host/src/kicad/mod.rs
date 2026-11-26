@@ -67,6 +67,7 @@ pub mod comment;
 pub mod progress;
 pub mod findings;
 pub mod checkrun;
+pub mod boardpng;
 pub mod savegate;
 pub mod edchecks;
 pub mod gerber;

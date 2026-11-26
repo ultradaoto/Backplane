@@ -204,7 +204,7 @@ fn board_form<'b>(f: &'b [u8], i: usize, sig: bool, nets: &board::Nets) -> Vec<I
     board::form_named(&mut o, &x, i, if sig { board::hash(f, board::FNV) } else { 0 }, nets);
     o
 }
-fn board_plot(fs: &[&[u8]]) -> (Plot, String) {
+pub fn board_plot(fs: &[&[u8]]) -> (Plot, String) {
     let (sh, nets) = (Shown::new(0), board::nets(fs));
     let per: Vec<(Vec<Option<Piece>>, Bx)> = par_map(fs.len(), &|i| {
         let mut e = Bx::empty();

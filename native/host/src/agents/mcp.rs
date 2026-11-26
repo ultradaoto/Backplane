@@ -220,7 +220,9 @@ impl Mcp {
                 // behind a tool search, a request of its own before the first edit)
                 if ag.has_design(thread).await { always_load(&mut tools, "kicad_edit");
                     // and `kicad_sim` (kicad/ksim.rs) where the KiCad runtime simulates
-                    if crate::files::kicad::ksim_tool::available(&ag).await { tools.push(crate::files::kicad::ksim_tool::def()) } }
+                    if crate::files::kicad::ksim_tool::available(&ag).await { tools.push(crate::files::kicad::ksim_tool::def()) }
+                    // and `board_render` (kicad/boardpng.rs): the hub's own plotter to a PNG, no KiCad needed
+                    tools.push(crate::files::kicad::boardpng::def()); }
                 Some(result(&id, json!({"tools":tools}))) }
             "tools/call" => self.call(&ag, thread, gen, &id, &p, sock).await,
             "ping" => Some(result(&id, json!({}))),
@@ -351,6 +353,7 @@ impl Mcp {
             "order_review" | "order_ask" | "order_quote" | "order_status" => crate::settings::order::call(ag, thread, name, &a).await,
             n if crate::term::tools::NAMES.contains(&n) => crate::term::tools::call(&ag.hub, thread, n, &a).await.unwrap_or_else(|| fail("unknown tool")),
             "viewer_show" => ag.viewer_show(thread, sv(&a, "path"), sv(&a, "kind"), true, true).await,
+            "board_render" => ag.tool_board_render(thread, &a).await,
             n if ag.tool_sets().iter().any(|s| s.owns(n)) => {
                 // a board or schematic written directly holds its document's lock, as a KiCad write does
                 let gate = if n == "files_write" { match ag.files_doc(thread, sv(&a, "path")).await { Some(doc) => ag.doc_gate(thread, &doc).await.err(), None => None } } else { None };
