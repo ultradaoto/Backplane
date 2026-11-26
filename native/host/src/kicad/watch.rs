@@ -14,6 +14,11 @@ const READERS: usize = 2;
 /// The most Mech parts meshed ahead when one is shown.
 const WARM_MECH: usize = 24;
 const POLL_MS: u64 = 150;
+/// A quiet stretch waits longer between looks, up to this (watch.wait.adapt): a view open with nothing happening — the person
+/// looking at a finished board — then stats nothing like an agent at work does, and every save lands a change, which resets the
+/// pace, so what the person watches moves as fast as while the agent works. The first change after a quiet stretch is seen up to
+/// POLL_MAX late once; on a big board the parse costs more than that.
+const POLL_MAX: u64 = 600;
 /// The most triangles a STEP's streamed batch carries in one part frame (about 16 bytes each: well under the hub's outbox and a phone's
 /// socket); a bigger batch is not streamed, the whole model brings it.
 const STREAM_PART_TRIS: usize = 300_000;
@@ -21,7 +26,9 @@ const STREAM_PART_TRIS: usize = 300_000;
 const IDENTITY: [f32; 12] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.];
 const KEPT: usize = 4; // sources no client watches are kept (plots included): Src.kept
 const VERSIONS_KEPT: usize = 8; // saved versions no view watches: Src.versions.kept
-const WAIT_TICKS: u32 = 7; // a view waiting for its project's first board or schematic looks for it about once a second
+/// How often a view waiting for its project's first board or schematic looks for it (watch.wait.adapt keeps this a second
+/// whatever the poll's own pace is).
+const WAIT_EVERY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Stamp { rev: String, ok: bool }
@@ -84,6 +91,10 @@ pub fn is_altium_board(p: &str) -> bool { p.to_ascii_lowercase().ends_with(".pcb
 pub fn kind_of(name: &str) -> Option<u32> { Some(match name { "board" => 0, "schematic" => 1, "3d" => 2, "3d-bare" => 3, "3d-full" => 4, _ => return None }) }
 /// FNV-1a of a key (Key.hash), the info file's name.
 pub fn fnv(s: &str) -> u32 { s.chars().fold(2166136261u32, |h, c| (h ^ c as u32).wrapping_mul(16777619)) }
+
+/// How long the next poll waits: a change puts the pace back to fast at once (the agent is at work; a source's first stamp is a
+/// change, so a fresh watch starts fast); a quiet tick grows it by half, up to POLL_MAX. 150 -> 225 -> 337 -> 505 -> 600.
+pub fn next_wait(wait: u64, changed: bool) -> u64 { if changed { POLL_MS } else { (wait * 3 / 2).min(POLL_MAX) } }
 
 #[derive(Default)]
 /// `parts`: a board model's part frames so far (the one that starts them first), `stop` its stream's (set when another replaces it)
@@ -723,11 +734,12 @@ impl Plots {
     }
 
     async fn poll(self: Arc<Self>, hub: Arc<Hub>) {
-        let mut tick = 0u32;
+        let mut since_look = Duration::ZERO;
+        let mut wait = POLL_MS;
         loop {
-            tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
-            tick = tick.wrapping_add(1);
-            if tick % WAIT_TICKS == 0 { self.look_for_waited(&hub) }
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            since_look += Duration::from_millis(wait);
+            if since_look >= WAIT_EVERY { self.look_for_waited(&hub); since_look = Duration::ZERO }
             let mut changed = vec![];
             { let mut st = self.st.lock().unwrap();
               // clients that went away
@@ -742,6 +754,9 @@ impl Plots {
                   let now = stamp_in(&s.file, rt);
                   if s.stamp.as_ref() != Some(&now) { changed.push(k.clone()) }
               } }
+            // watch.wait.adapt: a quiet tick waits longer, any change back to the fast pace (a source's first stamp is a change,
+            // so a fresh watch starts fast and a save during the quiet resets it)
+            wait = next_wait(wait, !changed.is_empty());
             for k in changed {
                 let file = { let st = self.st.lock().unwrap(); st.srcs.get(&k).map(|s| s.file.clone()).unwrap_or_default() };
                 self.prewarm(&hub, &file); // a board that changed may use new models
@@ -991,6 +1006,19 @@ impl RpcHandler for KicadRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// watch.wait.adapt: a change puts the pace back to fast at once; quiet grows it by half up to POLL_MAX; it never dips below fast.
+    #[test] fn a_quiet_poll_waits_longer_and_a_change_resets_it() {
+        let mut w = POLL_MS;
+        for _ in 0..50 { w = next_wait(w, false); } // (quiet for good: it stops growing at the cap)
+        assert_eq!(w, POLL_MAX, "{}", w);
+        assert_eq!(next_wait(POLL_MAX, true), POLL_MS, "a save puts the fast pace back");
+        // the growth from fast: 150 -> 225 -> 337 -> 506 -> 600 (a save anywhere along it resets)
+        let mut w = POLL_MS; let steps = vec![225, 337, 505, 600];
+        for want in steps { w = next_wait(w, false); assert_eq!(w, want, "{}", w); }
+        // the two cadences' cost: a minute idle stats each watched source 100 times at the cap's pace against 400 at the fast one
+        let (quiet, fast) = (60_000 / POLL_MAX, 60_000 / POLL_MS);
+        assert_eq!(fast, quiet * 4, "{} quiet looks against {} fast ones a minute", quiet, fast);
+    }
     #[test] fn a_window_that_reconnects_keeps_its_pane_by_its_cid() {
         super::super::embed::note_client_cid(911, "gpui-77-1");
         viewer_report_from(911, "t-pane-r", json!({"open": "board", "kicad": true, "kicadFrame": "PCB"}));
