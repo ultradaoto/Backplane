@@ -218,11 +218,23 @@ pub fn findings(report: &Value) -> Vec<String> {
     out
 }
 /// A finding without what a refill or a save changes in its words (a track's length, the place): what makes two findings the same one.
+/// (checkrun's tests read it too: a cached report's place prints as 1.0 where a fresh one prints 1, and must not mismatch.)
+pub fn finding_key_pub(f: &str) -> String { finding_key(f) }
 fn finding_key(f: &str) -> String {
     let mut k = f.split(" @").next().unwrap_or(f).to_string();
     while let Some(i) = k.find(", length ") { let e = k[i..].find(" mm").map_or(k.len(), |e| i + e + 3); k.replace_range(i..e, "") }
     // (the two items of a finding come in either order)
     match k.split_once(": ") { Some((ty, items)) => { let mut v: Vec<&str> = items.split(" / ").collect(); v.sort(); format!("{ty}: {}", v.join(" / ")) } None => k }
+}
+/// A report without the library findings (`src` "drc" or "erc" says whose they are, findings::library_rule): the same population a
+/// background check keeps, so a delta against one compares like with like. The other arrays and the wording stay as they are.
+fn library_free(report: &mut Value, src: &str) {
+    let keep = |v: &Value| !super::findings::library_rule(src, v["type"].as_str().unwrap_or(""));
+    let arr = |a: &mut Vec<Value>| a.retain(keep);
+    if let Some(a) = report["violations"].as_array_mut() { arr(a) }
+    if let Some(a) = report["unconnected_items"].as_array_mut() { arr(a) }
+    if let Some(a) = report["schematic_parity"].as_array_mut() { arr(a) }
+    if let Some(ss) = report["sheets"].as_array_mut() { for s in ss { if let Some(a) = s["violations"].as_array_mut() { arr(a) } } }
 }
 /// What an edit changed in KiCad's check: the findings that are new (12 at most, then their count), how many went away and how many are left.
 /// `touched` (nets and references the edit worked on; empty: everything) keeps a finding on something else out of `new`: a refill or the first
@@ -1303,7 +1315,13 @@ pub async fn run(c: &dyn Call, path: &str, a: &Value) -> Result<Value, String> {
         } }
         // the parts this call added, with the net each pin is now on (the saved schematic's own netlist)
         if out["saved"].is_string() && !r.board && !r.added.is_empty() { if let Ok(all) = r.c.nets().await { let m: Map<String, Value> = r.added.iter().filter(|a| all[a.as_str()].is_object()).map(|a| (a.clone(), all[a.as_str()].clone())).collect(); if !m.is_empty() { out["nets"] = Value::Object(m) } } }
-        if out["saved"].is_string() && !before.is_null() { if let Ok(now) = r.c.check().await { if !now.is_null() { out["check"] = check_delta(&before, &now, if r.touch_all || !r.board { &[] } else { &r.touched }) } } }
+        if out["saved"].is_string() && !before.is_null() { if let Ok(mut now) = r.c.check().await { if !now.is_null() {
+            // a before-list the background check kept without the library checks (its memory guard, checkrun.rs) is a smaller
+            // population than kicad-cli reports: the after loses its library findings too, so one the board or sheet had before
+            // the edit is not read as something the edit added
+            if before["lib"] == false { let src = if r.board { "drc" } else { "erc" }; library_free(&mut now, src); }
+            out["check"] = check_delta(&before, &now, if r.touch_all || !r.board { &[] } else { &r.touched })
+        } } }
     }
     if r.wrote && !r.board && r.sch_added {
         let texts = if out["saved"].is_string() { r.c.sheet_texts() } else { None };
@@ -1776,6 +1794,17 @@ mod tests {
         assert_eq!((out["check"].clone(), *c.1.lock().unwrap()), (json!({"by": "KiCad's DRC of the saved board, schematic parity included", "new": [], "left": 1, "elsewhere": {"count": 1, "first": ["clearance: Track [GND]"], "note": "on items this edit did not work on: a refill or the file's first save moves such findings about; they are this edit's only if its copper cut a pour there"}}), 2), "R1 was moved: a finding that does not name R1 is set apart, not hidden");
         let c = Checked(fake(None), Mutex::new(0)); let out = rt().block_on(run(&c, "/p/b.kicad_pcb", &json!({"ops": [{"find": "footprint"}]}))).unwrap(); assert_eq!((out.get("check"), *c.1.lock().unwrap()), (None, 0));
         let c = Checked(fake(None), Mutex::new(0)); rt().block_on(run(&c, "/p/b.kicad_pcb", &json!({"ops": [{"move": "R1", "by": [1, 0]}], "check": false}))).unwrap(); assert_eq!(*c.1.lock().unwrap(), 0);
+        // a before-list the background check kept without the library checks asks the after the same size: a library finding the
+        // board already had is not the edit's new one, and the schematic's sheets are gone through too
+        let mut after = json!({"violations": [v("clearance", "Track [A]"), v("lib_footprint_mismatch", "Footprint U3")], "unconnected_items": [v("lib_footprint_issues", "Footprint U4")]});
+        library_free(&mut after, "drc");
+        assert_eq!(after["violations"].as_array().unwrap().len(), 1); assert_eq!(after["unconnected_items"].as_array().unwrap().len(), 0, "{after}");
+        let mut sch = json!({"sheets": [{"violations": [v("label_dangling", "L1"), v("lib_symbol_issues", "D2")]}]});
+        library_free(&mut sch, "erc");
+        assert_eq!(sch["sheets"][0]["violations"].as_array().unwrap().len(), 1, "{sch}");
+        let mut clean = json!({"violations": [v("clearance", "Track [A]")]});
+        library_free(&mut clean, "drc");
+        assert_eq!(clean["violations"].as_array().unwrap().len(), 1, "nothing of the board's own findings goes");
     }
     #[test] fn raw_commands_run_in_order_with_the_document_filled_in() {
         let f = fake(None);

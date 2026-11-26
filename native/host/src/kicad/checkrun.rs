@@ -644,6 +644,7 @@ async fn run_cli(hub: &Arc<Hub>, pro: &str, f: &project::Files, s: &str, cancel:
 /// KiCad's check of one saved document as kicad-cli reports it (JSON): DRC of a board, ERC of a schematic. For `kicad_edit`, which says
 /// what an edit added to it (kedit::check_delta). None: no kicad-cli, or no report within 90 s.
 pub async fn report_of(hub: &Arc<Hub>, path: &str) -> Option<Value> {
+    if let Some(v) = cached_report(path) { return Some(v) }
     let rt = ipc::runtime(hub).await; if rt.cli.is_empty() { return None }
     let board = path.ends_with(".kicad_pcb"); let dir = cache_dir(hub); let _ = std::fs::create_dir_all(&dir);
     let out = dir.join(format!("edit-{}-{}.json", std::process::id(), ks::digest(&format!("{path}{:?}", std::time::Instant::now()))));
@@ -657,6 +658,29 @@ pub async fn report_of(hub: &Arc<Hub>, path: &str) -> Option<Value> {
 }
 /// The root schematic of the project `path` belongs to (a sub-sheet is checked and netlisted through its root).
 fn root_sch(path: &str) -> String { let pro = ipc::pro_of(path); let root = format!("{}.kicad_sch", pro.trim_end_matches(".kicad_pro")); if !pro.is_empty() && Path::new(&root).exists() { root } else { path.to_string() } }
+
+/// The background check's finished findings for this document, as kicad-cli's JSON would carry them (`"lib": false` when the run kept
+/// no library rules, as the background's do not), when the last run is of the files as they are now: fresh (its revision is the one on
+/// disk, not failed, not a run in flight of another), so a save has a check of the saved state already going or done. `kicad_edit`'s
+/// "before" list reads back by the words KiCad wrote (kedit::findings), which an anchor's text and place carry whole; the marker makes
+/// the "after" list the same size (kedit::run drops the library rules from it too). None: run kicad-cli as before.
+fn cached_report(path: &str) -> Option<Value> {
+    let board = path.ends_with(".kicad_pcb");
+    let pro = ipc::pro_of(path); if pro.is_empty() { return None }
+    with(&pro, |p| {
+        let x = if board { &p.drc } else { &p.erc };
+        if !(x.had && x.state.is_empty() && x.sched.running_since == 0 && !x.sched.disk_rev.is_empty() && x.sched.ran_rev == x.sched.disk_rev) { return None }
+        let mut violations = vec![]; let mut unconnected = vec![];
+        for f in &x.findings {
+            let items: Vec<Value> = f.anchors.iter().map(|a| { let mut i = json!({"description": a.text}); if a.at { i["pos"] = json!({"x": a.x, "y": a.y}); } i }).collect();
+            let v = json!({"type": f.rule, "severity": f.severity, "description": f.title, "items": items});
+            if f.rule == "unconnected_items" { unconnected.push(v) } else { violations.push(v) }
+        }
+        // (the schematic parity's findings stand among the violations: kedit::findings reads both the same way)
+        if board { Some(json!({"violations": violations, "unconnected_items": unconnected, "lib": x.full})) }
+        else { Some(json!({"sheets": [{"violations": violations}], "lib": x.full})) }
+    }).flatten()
+}
 /// The saved schematic's netlist as {reference: {pin: net}}, from kicad-cli's export (for `kicad_edit`: the nets of the parts an edit added).
 pub async fn netlist_of(hub: &Arc<Hub>, path: &str) -> Option<Value> {
     let rt = ipc::runtime(hub).await; if rt.cli.is_empty() { return None }
@@ -1142,9 +1166,58 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         let _ = std::fs::remove_dir_all(&d);
     }
+    /// A fresh background check stands in for kicad_edit's "before" run: its findings read back as kicad-cli's report would
+    /// (kedit::findings), and a stale, failed or running one stands in for nothing.
+    #[test] fn a_fresh_background_check_stands_in_for_the_edit_before_run() {
+        let d = crate::plat::tmp::dir("checkrun-cached");
+        std::fs::write(d.join("p.kicad_pro"), "{}").unwrap(); std::fs::write(d.join("p.kicad_pcb"), "(kicad_pcb)").unwrap(); std::fs::write(d.join("p.kicad_sch"), "(kicad_sch)").unwrap();
+        let (pro, pcb, sch) = (d.join("p.kicad_pro").to_string_lossy().into_owned(), d.join("p.kicad_pcb").to_string_lossy().into_owned(), d.join("p.kicad_sch").to_string_lossy().into_owned());
+        let anchor = |text: &str, at: bool| fd::Anchor { doc: "pcb".into(), text: text.into(), x: 1.0, y: 2.0, at, ..Default::default() };
+        let mut p = Proj::default();
+        p.drc.had = true; p.drc.full = false; p.drc.sched.ran_rev = "r1".into(); p.drc.sched.disk_rev = "r1".into();
+        p.drc.findings = vec![
+            Finding { id: "drc:1".into(), source: "drc".into(), severity: "error".into(), rule: "clearance".into(), title: "Clearance violation (actual 0.0250 mm)".into(),
+                anchors: vec![anchor("Track [A]", true), anchor("Pad 1 [B] of C2", false)], ..Default::default() },
+            Finding { id: "drc:2".into(), source: "drc".into(), severity: "error".into(), rule: "unconnected_items".into(), title: "Missing connection between items".into(),
+                anchors: vec![anchor("Pad 1 [N] of R1", false)], ..Default::default() },
+        ];
+        state().lock().unwrap().insert(pro.clone(), p);
+        let v = cached_report(&pcb).unwrap();
+        assert_eq!(v["lib"], false, "a background run keeps no library rules: the after is asked the same size");
+        let lines = super::super::kedit::findings(&v);
+        // (the same finding reads back to the same key a fresh report gives: kedit::finding_key keeps the type and the items' names,
+        // and leaves the place out, so a whole-number position shown as 1.0 against a fresh 1 never mismatches)
+        assert_eq!(lines, vec!["clearance: Track [A] / Pad 1 [B] of C2 @1.0,2.0", "unconnected: Pad 1 [N] of R1"], "{lines:?}");
+        assert_eq!(super::super::kedit::finding_key_pub(&lines[0]), super::super::kedit::finding_key_pub("clearance: Track [A] / Pad 1 [B] of C2 @1,2"));
+        { let mut m = state().lock().unwrap(); let x = m.get_mut(&pro).unwrap();
+            x.drc.sched.disk_rev = "r2".into(); } // (the lock goes before each look: cached_report takes it too)
+        assert!(cached_report(&pcb).is_none(), "stale: the files changed since the run");
+        { let mut m = state().lock().unwrap(); let x = m.get_mut(&pro).unwrap();
+            x.drc.sched.disk_rev = "r1".into(); x.drc.state = "failed".into(); }
+        assert!(cached_report(&pcb).is_none(), "a failed run is no report");
+        { let mut m = state().lock().unwrap(); let x = m.get_mut(&pro).unwrap();
+            x.drc.state.clear(); x.drc.sched.running_since = 5; }
+        assert!(cached_report(&pcb).is_none(), "a run in flight says nothing yet");
+        { let mut m = state().lock().unwrap(); let x = m.get_mut(&pro).unwrap();
+            x.drc.sched.running_since = 0; x.drc.sched.ran_rev.clear(); x.drc.sched.disk_rev.clear(); x.drc.had = false; }
+        assert!(cached_report(&pcb).is_none(), "never run: nothing");
+        { let mut m = state().lock().unwrap(); let x = m.get_mut(&pro).unwrap();
+            x.drc.had = true; x.drc.sched.ran_rev = "r1".into(); x.drc.sched.disk_rev = "r1".into(); }
+        // the schematic's check answers through its project too, with the sheets shape the ERC wording rides on (kedit::check_delta's `by`)
+        let mut p2 = Proj::default();
+        p2.erc.had = true; p2.erc.full = true; p2.erc.sched.ran_rev = "e1".into(); p2.erc.sched.disk_rev = "e1".into();
+        p2.erc.findings = vec![Finding { id: "erc:1".into(), source: "erc".into(), severity: "error".into(), rule: "label_dangling".into(), title: "Label not connected".into(),
+            anchors: vec![fd::Anchor { doc: "sch".into(), text: "Label 'SWD.CLK'".into(), ..Default::default() }], ..Default::default() }];
+        state().lock().unwrap().insert(pro.clone(), p2);
+        let v = cached_report(&sch).unwrap();
+        assert_eq!(v["lib"], true, "a full run's list is the whole report");
+        assert!(v["sheets"].is_array(), "{}", v);
+        assert_eq!(super::super::kedit::findings(&v), vec!["label_dangling: Label 'SWD.CLK'"]);
+        state().lock().unwrap().remove(&pro);
+        let _ = std::fs::remove_dir_all(&d);
+    }
     #[test] fn a_comparisons_differences_are_findings_with_steady_ids() {
-        use super::super::gerber::compare::Place;
-        let pl = |b: [f32; 4], board: bool, gerbers: bool, what: &str| Place { b, board, gerbers, what: what.into() };
+        use super::super::gerber::compare::Place;        let pl = |b: [f32; 4], board: bool, gerbers: bool, what: &str| Place { b, board, gerbers, what: what.into() };
         let ps = vec![("F.Cu".to_string(), pl([1.0, 2.0, 1.4, 2.2], true, false, "track on GND near U5")), ("B.Cu".to_string(), pl([5.0, 5.0, 6.0, 6.0], false, true, "copper")), ("B.Cu".to_string(), pl([8.0, 5.0, 9.0, 6.0], true, true, "pad C12.1 on VBUS"))];
         let mut a = gerber_findings("/p/mfg/g", &ps, 0); fd::assign_ids(&mut a);
         let mut b = gerber_findings("/p/mfg/g", &ps.iter().rev().cloned().collect::<Vec<_>>(), 0); fd::assign_ids(&mut b);
