@@ -13,12 +13,42 @@ use std::sync::Arc;
 /// Accounts.public: what a client is told of the snapshot (no attempts: their links and codes are for the connection that asked).
 pub fn public(snapshot: &Value) -> String { json!({"version":1,"revision":snapshot["revision"].as_u64().unwrap_or(0),"profiles":snapshot["profiles"].clone(),"defaultLogin":snapshot["default_login"].clone(),"error":snapshot["error"].as_str().unwrap_or("")}).to_string() }
 
+/// Accounts.changes.still: the inventory judged by its content, not by every look's numbers. The revision (each client's own signal to
+/// re-read the live snapshot) and the readings' `at`/`attempted_at` are out of the comparison: the 5-minute recheck bumps the revision
+/// and re-times the readings whether or not it learned anything, and `changes` then wrote the whole inventory again — the log kept a
+/// copy each time, 57% of one 16-hour log's bytes. What a restart still needs decides: profiles (ids, epochs, states, identities,
+/// catalogs, messages), their windows and resets, the defaults, the error. A kept reading older than [`super::provider_usage::KEEP_S`]
+/// writes again, so an `at` a staleness reader works from never goes fully stale (the same rule `worth` keeps the providers' own
+/// readings by).
+fn bare(v: &Value) -> Value {
+    let strip = |v: &Value| { let mut v = v.clone(); if let Some(m) = v.as_object_mut() { m.remove("at"); m.remove("attempted_at"); } v };
+    let mut o = v.clone();
+    if let Some(m) = o.as_object_mut() {
+        m.remove("revision");
+        for k in ["default_allowance", "default_allowance_codex"] { if let Some(a) = m.get_mut(k) { if !a.is_null() { *a = strip(a); } } }
+        if let Some(ps) = m.get_mut("profiles").and_then(Value::as_array_mut) { for p in ps.iter_mut() { if let Some(a) = p.get_mut("allowance") { if !a.is_null() { *a = strip(a); } } } }
+    }
+    o
+}
+/// The newest reading time an inventory holds (0 with none: nothing to go stale).
+fn newest_at(v: &Value) -> u64 {
+    match v {
+        Value::Object(m) => m.iter().map(|(k, x)| if k == "at" || k == "attempted_at" { x.as_u64().unwrap_or(0) } else { newest_at(x) }).fold(0u64, u64::max),
+        Value::Array(a) => a.iter().map(newest_at).fold(0u64, u64::max),
+        _ => 0,
+    }
+}
+
 /// Accounts.changes: the inventory when it moved, and a default whose profile is gone (only from a snapshot without an error).
 pub fn changes(get: &dyn Fn(&str) -> String, snapshot: &Value, at: u64) -> Vec<Value> {
     let value = public(snapshot);
     let set = |k: &str, v: String| json!({"$":"SettingSet","key":k,"value":v,"at":at});
     let mut out = vec![];
-    if get("accounts.inventory") != value { out.push(set("accounts.inventory", value)) }
+    let stored = get("accounts.inventory");
+    let (old, new) = (serde_json::from_str::<Value>(&stored).unwrap_or(Value::Null), serde_json::from_str::<Value>(&value).unwrap_or(Value::Null));
+    let newest = newest_at(&old);
+    let same = !stored.is_empty() && bare(&old) == bare(&new);
+    if !same || (newest > 0 && at.saturating_sub(newest) >= super::provider_usage::KEEP_S) { out.push(set("accounts.inventory", value)) }
     if snapshot["error"].as_str().unwrap_or("").is_empty() {
         let ids: Vec<&str> = snapshot["profiles"].as_array().map(|a| a.iter().filter_map(|p| p["id"].as_str()).collect()).unwrap_or_default();
         for provider in ["claude", "codex"] {
@@ -358,6 +388,26 @@ mod tests {
         assert_eq!(c[1]["value"], accounts::binding_show("", 0));
         assert!(changes(&|k| if k == "accounts.inventory" { public(&s) } else { String::new() }, &s, 9).is_empty(), "an unchanged inventory writes nothing");
         assert_eq!(changes(&get, &snap(json!([]), "The private account registry could not be verified."), 9).len(), 1, "a snapshot with an error removes no default");
+    }
+    /// The inventory judged by its content: a recheck that only bumped the revision and re-timed the readings writes nothing, one past
+    /// KEEP_S writes again (a staleness reader's `at` never goes fully stale), and a real change always does.
+    #[test] fn the_inventory_is_not_written_again_for_a_revision_and_retimed_readings_alone() {
+        let with = |rev: u64, at: u64| json!({"version":1,"revision":rev,"error":"","default_login":json!({}),
+            "profiles":[{"id":"w","provider":"claude","label":"Work","epoch":2,"state":"connected","identity":{"email":"w@x.com"},"allowance":{"provider":"claude","state":"ok","at":at,"attempted_at":at,"windows":[{"scope":"five_hour","used_percent":42.0}]}}]});
+        let s = with(3, 1000); // (a snapshot as the collector makes it)
+        // the stored side is what changes() itself writes: public()'s shape (defaultLogin), revision and all
+        let get = |k: &str| if k == "accounts.inventory" { public(&with(2, 1000)) } else { String::new() };
+        // the recheck learned nothing (the same windows): revision 3 -> 9 and the readings re-timed to 2000 are no change
+        assert!(changes(&get, &s, 2000).is_empty(), "only the revision and the times moved");
+        // 30 minutes past the reading: written again, so the kept `at` is never fully stale (KEEP_S is the providers' own rule)
+        let wrote = changes(&get, &s, 1000 + super::super::provider_usage::KEEP_S);
+        assert_eq!(wrote.len(), 1); assert_eq!(wrote[0]["key"], "accounts.inventory");
+        // a real change (a window filled): written at once
+        let mut filled = s.clone(); filled["profiles"][0]["allowance"]["windows"][0]["used_percent"] = json!(80.0);
+        assert_eq!(changes(&get, &filled, 2000).len(), 1, "{filled}");
+        // a profile gone: written at once
+        let mut gone = s.clone(); gone["profiles"] = json!([]);
+        assert_eq!(changes(&get, &gone, 2000).len(), 1);
     }
     #[test] fn a_thread_is_retired_when_its_account_changed_disconnected_or_vanished() {
         let inv = json!({"profiles":[{"id":"w","epoch":2,"state":"connected"},{"id":"d","epoch":1,"state":"disconnected"}]}).to_string();
