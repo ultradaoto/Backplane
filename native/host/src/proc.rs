@@ -496,10 +496,15 @@ pub async fn wait(child: &mut tokio::process::Child) -> std::io::Result<std::pro
 }
 /// `Command::output`, with the exit taken by [`wait`]: stdout and stderr read to their ends (both at once, so neither pipe fills), then the exit. As tokio's
 /// `output()`, the child's stdin is null: nothing is ever written to it here, so a piped one would hold a child that reads it until the wait.
-pub async fn output(c: &mut tokio::process::Command) -> std::io::Result<std::process::Output> {
-    use tokio::io::AsyncReadExt;
-    c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+pub async fn output(c: &mut tokio::process::Command) -> std::io::Result<std::process::Output> { output_in(c, None).await }
+/// `output`, with `stdin` fed to the child whole before its pipes are read (as a shell's `git ... < file`): the write ends and closes, so a child
+/// that reads its input to the end never holds the wait.
+pub async fn output_in(c: &mut tokio::process::Command, stdin: Option<&[u8]>) -> std::io::Result<std::process::Output> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    match stdin { Some(_) => { c.stdin(std::process::Stdio::piped()); } None => { c.stdin(std::process::Stdio::null()); } }
+    c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = c.spawn()?;
+    if let Some(b) = stdin { if let Some(mut si) = child.stdin.take() { let _ = si.write_all(b).await; } } // closed: the child reads EOF
     let (mut o, mut e) = (child.stdout.take(), child.stderr.take());
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     let read_o = async { if let Some(p) = o.as_mut() { p.read_to_end(&mut stdout).await.map(|_| ()) } else { Ok(()) } };

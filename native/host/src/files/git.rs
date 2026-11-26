@@ -7,7 +7,8 @@ use std::path::Path;
 use tokio::process::Command;
 
 pub const SAFE: &str = include_str!("scripts/safe.sh");
-const INDEX_SEED: &str = include_str!("scripts/index_seed.sh");
+// (scripts/index_seed.sh stays in the tree for test/files/extract_scripts.py's equality check and files/snapshot.rs's own use;
+// the hub's snapshot seeds its index natively, `index_seed` below)
 const STEP: &str = include_str!("scripts/step.sh");
 const REFS: &str = include_str!("scripts/refs.sh");
 const INIT: &str = include_str!("scripts/init.sh");
@@ -20,8 +21,9 @@ pub const GIT_ENV: [(&str, &str); 12] = [("GIT_CONFIG_COUNT", "5"), ("GIT_CONFIG
 
 pub struct Ran { pub code: i32, pub out: String }
 
-/// P.Proc.run: `cmd args` in `cwd`, stdin closed, stdout then stderr, code 127 when it cannot start.
-async fn spawn(cmd: &str, args: &[&str], cwd: &str, env: &[(&str, &str)], kill: bool, write: bool) -> Ran {
+/// P.Proc.run: `cmd args` in `cwd`, stdin closed (or fed `stdin`), stdout then stderr, code 127 when it cannot start.
+async fn spawn(cmd: &str, args: &[&str], cwd: &str, env: &[(&str, &str)], kill: bool, write: bool) -> Ran { spawn_in(cmd, args, cwd, env, kill, write, None).await }
+async fn spawn_in(cmd: &str, args: &[&str], cwd: &str, env: &[(&str, &str)], kill: bool, write: bool, stdin: Option<&[u8]>) -> Ran {
     // default-deny on a copy (BACKPLANE_COPY=1): only a call that says it is a read (`read`, `proc_ro`, `run_ro`, `sh_ro`) runs; `proc`, `run`, `run_idx`, `sh` are writes or unknown
     if let Some(why) = write_refused(crate::copy::on(), write, cmd) { return Ran { code: 126, out: why } }
     // Proc.run.folder: an empty working folder is refused, never the hub's own directory
@@ -29,11 +31,11 @@ async fn spawn(cmd: &str, args: &[&str], cwd: &str, env: &[(&str, &str)], kill: 
     // a copy of a log runs no network command (copy.rs: curl, gh, ssh, git push/fetch..., also through sh -c)
     if crate::copy::refused(cmd, args) { return Ran { code: 126, out: crate::copy::refusal(cmd) } }
     let mut c = crate::proc::tokio_cmd(crate::proc::Kind::Local, cmd);
-    c.args(args).current_dir(cwd).stdin(std::process::Stdio::null()).envs(GIT_ENV.iter().copied()).envs(env.iter().copied()).kill_on_drop(kill);
+    c.args(args).current_dir(cwd).envs(GIT_ENV.iter().copied()).envs(env.iter().copied()).kill_on_drop(kill);
     // a listed read on a copy must not refresh the real repository's index or take its lock while a live agent works there (git status would)
     if crate::copy::on() { c.env("GIT_OPTIONAL_LOCKS", "0"); }
     // the exit through proc::output (proc::wait): tokio's own output() waits for SIGCHLD once the pipes close, and a macOS hub that misses it waits for ever (#1108, #1110)
-    match crate::proc::output(&mut c).await {
+    match crate::proc::output_in(&mut c, stdin).await {
         Ok(o) => { let mut out = String::from_utf8_lossy(&o.stdout).into_owned(); out.push_str(&String::from_utf8_lossy(&o.stderr)); Ran { code: o.status.code().unwrap_or(1), out } }
         Err(e) => Ran { code: 127, out: e.to_string() },
     }
@@ -85,7 +87,9 @@ pub async fn run(cwd: &str, args: &[&str]) -> Ran { git_safe(cwd, args, &[], tru
 /// Git.run for git that only reads (rev-parse, status, for-each-ref, cat-file, ls-files, a diff between two refs).
 pub async fn run_ro(cwd: &str, args: &[&str]) -> Ran { git_safe(cwd, args, &[], false).await }
 /// Git.run.idx: git with a private index file
-pub async fn run_idx(cwd: &str, idx: &str, args: &[&str]) -> Ran { git_safe(cwd, args, &[("GIT_INDEX_FILE", idx)], true).await }
+pub async fn run_idx(cwd: &str, idx: &str, args: &[&str]) -> Ran { git_safe_in(cwd, args, &[("GIT_INDEX_FILE", idx)], true, None).await }
+/// `run_idx` with the child's input fed whole (update-index --index-info's listing).
+pub async fn run_idx_in(cwd: &str, idx: &str, args: &[&str], stdin: &[u8]) -> Ran { git_safe_in(cwd, args, &[("GIT_INDEX_FILE", idx)], true, Some(stdin)).await }
 /// `run` with more environment (an author, a private index): a write.
 pub async fn run_env(cwd: &str, args: &[&str], env: &[(&str, &str)]) -> Ran { git_safe(cwd, args, env, true).await }
 
@@ -113,11 +117,12 @@ tokio::task_local! { static SAFE_HELD: (String, Vec<(String, String)>); }
 pub async fn with_safe<F: std::future::Future>(cwd: &str, f: F) -> F::Output { let e = safe_env(cwd).await; SAFE_HELD.scope((cwd.to_string(), e), f).await }
 /// git run directly in `cwd` with the safe environment (`safe_env`, or the one `with_safe` read for `cwd`) and `env`; `write` as `proc`
 /// (refused on a copy), else as `proc_ro`.
-async fn git_safe(cwd: &str, args: &[&str], env: &[(&str, &str)], write: bool) -> Ran {
+async fn git_safe(cwd: &str, args: &[&str], env: &[(&str, &str)], write: bool) -> Ran { git_safe_in(cwd, args, env, write, None).await }
+async fn git_safe_in(cwd: &str, args: &[&str], env: &[(&str, &str)], write: bool, stdin: Option<&[u8]>) -> Ran {
     let held = SAFE_HELD.try_with(|(c, e)| (c == cwd).then(|| e.clone())).ok().flatten();
     let safe = match held { Some(e) => e, None => safe_env(cwd).await };
     let mut e: Vec<(&str, &str)> = safe.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(); e.extend_from_slice(env);
-    spawn("git", args, cwd, &e, false, write).await
+    spawn_in("git", args, cwd, &e, false, write, stdin).await
 }
 /// Git.seq: a non-zero exit is "error: <output>", else the trimmed output (raw keeps it untouched, for diffs).
 fn seq(r: Ran, raw: bool) -> Result<String, String> { if r.code == 0 { Ok(if raw { r.out } else { r.out.trim().to_string() }) } else { Err(format!("error: {}", r.out.trim())) } }
@@ -143,12 +148,24 @@ pub async fn is_repo(cwd: &str) -> bool { let r = run_ro(cwd, &["rev-parse", "--
 /// Git.status: `git status --porcelain=v1 --branch -uall` text, or "error: ...".
 pub async fn status(cwd: &str) -> String { flat(seq(run_ro(cwd, &["-c", "core.quotepath=false", "status", "--porcelain=v1", "--branch", "-uall"]).await, true)) }
 
-async fn index_seed(cwd: &str, idx: &str) -> Ran { sh(INDEX_SEED, &[idx], cwd, &[]).await }
+/// Git.snapshot's index seed, native (was scripts/index_seed.sh through sh; that spawn is one of two left in a snapshot on Windows, where
+/// a process costs): the thread's private index seeded from the repository's own, so its `add -A` and `write-tree` never touch the real
+/// index. The real index's listing is captured first, the private index removed and refilled from it; a repository with no index yet
+/// (nothing ever staged) leaves none. (The listing rides a String both ways, as every other answer here does.)
+pub async fn index_seed(cwd: &str, idx: &str) -> Result<(), String> {
+    let src = seq(run(cwd, &["rev-parse", "--path-format=absolute", "--git-path", "index"]).await, false)?;
+    if !Path::new(&src).is_file() { let _ = std::fs::remove_file(idx); return Ok(()) }
+    let listing = seq(run(cwd, &["ls-files", "--full-name", "--stage", "-z", "--", ":/"]).await, true)?; // raw: the NUL separators stay
+    let _ = std::fs::remove_file(idx);
+    seq(run_idx(cwd, idx, &["read-tree", "--empty"]).await, false)?;
+    seq(run_idx_in(cwd, idx, &["-c", "core.ignorestat=false", "update-index", "-z", "--index-info"], listing.as_bytes()).await, false)?;
+    Ok(())
+}
 /// Git.snapshot: the work tree (tracked, ignored tracked, untracked non-ignored) as a tree id, through the thread's private index.
 pub async fn snapshot(cwd: &str, thread: &str) -> Result<String, String> {
     let gd = seq(run(cwd, &["rev-parse", "--absolute-git-dir"]).await, false)?;
     let idx = format!("{gd}/backplane-{}.index", b64url(thread));
-    seq(index_seed(cwd, &idx).await, false)?;
+    index_seed(cwd, &idx).await?;
     seq(run_idx(cwd, &idx, &["add", "-A"]).await, false)?;
     seq(run_idx(cwd, &idx, &["write-tree"]).await, false)
 }
@@ -196,7 +213,7 @@ pub async fn checkpoint_revert(cwd: &str, thread: &str, n: u64) -> String {
         let gd = seq(run(cwd, &["rev-parse", "--absolute-git-dir"]).await, false)?;
         let idx = format!("{gd}/backplane-{}.index", b64url(thread));
         let tree = seq(run(cwd, &["rev-parse", "--verify", &format!("{}^{{tree}}", checkpoint_ref(thread, n))]).await, false)?;
-        seq(index_seed(cwd, &idx).await, false)?;
+        index_seed(cwd, &idx).await?;
         seq(run_idx(cwd, &idx, &["add", "-A"]).await, false)?;
         seq(run_idx(cwd, &idx, &["read-tree", "-u", "--reset", &tree]).await, false)?;
         Ok::<String, String>(String::new())
@@ -314,6 +331,29 @@ mod tests {
         assert_eq!(checkpoint_ref("t1", 3), "refs/backplane/checkpoints/dDE/turn/3");
     }
     #[test] fn failed_words() { assert!(failed("error: x")); assert!(failed("a\nerror: b")); assert!(!failed("fine error: x")); assert!(!failed("")) }
+    /// The native index seed (index_seed, was scripts/index_seed.sh through sh): the thread's private
+    /// index holds exactly what the repository's own does — its write-tree gives the same tree id —
+    /// and the real index is never touched (a.txt stays unstaged, new.txt untracked).
+    #[tokio::test] async fn the_private_index_is_seeded_from_the_real_one_without_touching_it() {
+        let d = tmp("seed"); g(&d, &["init", "-q"]).await; g(&d, &["config", "core.autocrlf", "false"]).await;
+        std::fs::write(format!("{d}/a.txt"), "one\n").unwrap(); std::fs::write(format!("{d}/b.txt"), "two\n").unwrap();
+        g(&d, &["add", "a.txt"]).await; g(&d, &["commit", "-qm", "i"]).await;
+        std::fs::write(format!("{d}/a.txt"), "one changed\n").unwrap(); std::fs::write(format!("{d}/new.txt"), "n\n").unwrap();
+        let gd = seq(run(&d, &["rev-parse", "--absolute-git-dir"]).await, false).unwrap();
+        let idx = format!("{gd}/backplane-seed.index");
+        index_seed(&d, &idx).await.unwrap();
+        let priv_tree = seq(run_idx(&d, &idx, &["write-tree"]).await, false).unwrap();
+        let real_tree = seq(run(&d, &["write-tree"]).await, false).unwrap();
+        assert_eq!(priv_tree, real_tree, "the seeded index is the repository's own");
+        // the real index never moved: a.txt's change and new.txt are not in it
+        assert!(status(&d).await.contains(" M a.txt") && status(&d).await.contains("?? new.txt"), "{}", status(&d).await);
+        // a repository with no index yet (nothing ever staged): no seed, an empty private index
+        let d2 = tmp("seed-none"); g(&d2, &["init", "-q"]).await;
+        let gd2 = seq(run(&d2, &["rev-parse", "--absolute-git-dir"]).await, false).unwrap();
+        let idx2 = format!("{gd2}/backplane-seed.index");
+        index_seed(&d2, &idx2).await.unwrap();
+        assert!(seq(run_idx(&d2, &idx2, &["write-tree"]).await, false).unwrap() == seq(run(&d2, &["hash-object", "-t", "tree", "/dev/null"]).await, false).unwrap(), "the empty tree");
+    }
     // commands/home.rs times out git log / gh pr list: a READ's child must be gone when the future is dropped; a plain call (a write) must outlive the timeout
     #[cfg(target_os = "linux")] fn alive(pid: i32) -> bool { std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(false, |s| !s.contains(") Z ")) }
     #[cfg(target_os = "linux")] async fn gone_within(pid: i32, ms: u64) -> bool { for _ in 0..ms / 25 { if !alive(pid) { return true } tokio::time::sleep(std::time::Duration::from_millis(25)).await } !alive(pid) }
