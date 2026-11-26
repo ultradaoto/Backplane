@@ -20,6 +20,19 @@ pub(crate) fn canon_in(p: &Path, canon_root: &Path) -> Option<PathBuf> {
     c.starts_with(canon_root).then_some(c)
 }
 
+/// A listed entry of `dir` with its metadata, canonicalised only when it has to be: `dir` is canonical and inside `root` (each walk checks
+/// it before listing), so one that is not a link is inside `root` as it stands. Resolving each of a set's files instead costs a canonicalize
+/// apiece (an open per path component, and on Windows the extended-path query), which the presenter pays on every picture it draws.
+pub(crate) fn entry_in(dir: &Path, e: &std::fs::DirEntry, root: &Path) -> Option<(PathBuf, std::fs::Metadata)> {
+    let p = dir.join(e.file_name());
+    match std::fs::symlink_metadata(&p) {
+        // a file or folder that is not a link: the path is already what canonicalize would answer
+        Ok(md) if !md.file_type().is_symlink() => Some((p, md)),
+        // a link (or one that cannot be read): resolved, and kept only inside the root, as canon_in does
+        _ => { let c = canon_in(&p, root)?; let md = std::fs::metadata(&c).ok()?; Some((c, md)) }
+    }
+}
+
 /// The files of a set: a folder's fab files (and its subfolders', two deep: mfg/gerbers/), a job file's folder's, or the one file.
 /// Every directory and file read must canonicalise inside `root` (or inside the set's own canonical folder when `root` is `None`).
 /// Returns canonical paths so callers open the verified target directly.
@@ -49,9 +62,8 @@ fn set_listing(path: &Path, root: Option<&Path>) -> (Vec<PathBuf>, Option<std::t
         let mut es: Vec<_> = rd.flatten().collect();
         es.sort_by_key(|e| e.file_name());
         for e in es {
-            let p = e.path(); let n = e.file_name().to_string_lossy().into_owned();
-            let Some(cp) = canon_in(&p, bound) else { continue };
-            let Ok(meta) = cp.metadata() else { continue };
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some((cp, meta)) = entry_in(&cd, &e, bound) else { continue };
             if meta.is_dir() { if depth > 0 && !n.starts_with('.') { walk(&cp, depth - 1, bound, out, newest) } } else if meta.is_file() && is_fab_file(&n) {
                 if is_gerber(&n) || is_drill(&n) { *newest = (*newest).max(meta.modified().ok()); }
                 out.push(cp);
@@ -78,9 +90,9 @@ pub fn has_gerbers(root: &Path) -> bool {
         let Some(cd) = canon_in(d, canon_root) else { return false };
         let Ok(rd) = std::fs::read_dir(&cd) else { return false };
         for e in rd.flatten() {
-            let p = e.path(); let n = e.file_name().to_string_lossy().into_owned();
-            let Some(cp) = canon_in(&p, canon_root) else { continue };
-            if cp.is_dir() { if depth > 0 && !n.starts_with('.') && walk(&cp, depth - 1, canon_root) { return true } }
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some((cp, md)) = entry_in(&cd, &e, canon_root) else { continue };
+            if md.is_dir() { if depth > 0 && !n.starts_with('.') && walk(&cp, depth - 1, canon_root) { return true } }
             else if is_gerber(&n) || is_drill(&n) { return true }
         }
         false
@@ -102,10 +114,10 @@ pub fn newest_set(root: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
         let Ok(rd) = std::fs::read_dir(&cd) else { return };
         let mut newest: Option<std::time::SystemTime> = None;
         for e in rd.flatten() {
-            let p = e.path(); let n = e.file_name().to_string_lossy().into_owned();
-            let Some(cp) = canon_in(&p, canon_root) else { continue };
-            if cp.is_dir() { if depth > 0 && !n.starts_with('.') { walk(&cp, depth - 1, canon_root, best) } }
-            else if is_gerber(&n) || is_drill(&n) { if let Ok(t) = std::fs::metadata(&cp).and_then(|m| m.modified()) { newest = Some(newest.map_or(t, |x| x.max(t))) } }
+            let n = e.file_name().to_string_lossy().into_owned();
+            let Some((cp, md)) = entry_in(&cd, &e, canon_root) else { continue };
+            if md.is_dir() { if depth > 0 && !n.starts_with('.') { walk(&cp, depth - 1, canon_root, best) } }
+            else if is_gerber(&n) || is_drill(&n) { if let Ok(t) = md.modified() { newest = Some(newest.map_or(t, |x| x.max(t))) } }
         }
         if let Some(t) = newest { if best.as_ref().map_or(true, |b| t > b.0) { *best = Some((t, cd)) } }
     }

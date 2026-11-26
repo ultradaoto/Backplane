@@ -3620,6 +3620,35 @@ mod tests {
     }
 
 
+    /// A thread picture asks its project for the rail sources on every state change, and an agent streams many (a tool call, every line of a
+    /// message, every state it moves through): the ask has to stay cheap. It walks the project, its Gerbers three deep and its mech parts; the
+    /// walk no longer canonicalises every file it lists (only a link needs it), which is most of the cost. Printed, and kept loose: a busy
+    /// machine is slow.
+    #[test] fn a_projects_rail_sources_are_cheap_to_ask_for_every_picture() {
+        let d = crate::plat::tmp::canonical("rail-measure");
+        std::fs::create_dir_all(d.join("boards")).unwrap(); std::fs::create_dir_all(d.join("mech")).unwrap();
+        std::fs::write(d.join("rc.kicad_pcb"), "(kicad_pcb)").unwrap();
+        std::fs::write(d.join("rc.kicad_sch"), "(kicad_sch)").unwrap();
+        std::fs::write(d.join("rc.kicad_pro"), "{}").unwrap();
+        for k in 0..5 { std::fs::write(d.join(format!("mech/part{k}.step")), "x").unwrap() }
+        for set in ["mfg/a", "mfg/b"] {
+            std::fs::create_dir_all(d.join(set)).unwrap();
+            for k in 0..12 { std::fs::write(d.join(set).join(format!("l{k}.gbr")), "G04*").unwrap() }
+        }
+        let root = d.to_string_lossy().into_owned();
+        let n = 40;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let s = rail_sources(&root);
+            assert!(s.board && s.schematic && s.mech && s.gerbers, "the project's board, sheet, mech parts and Gerbers are found");
+            let set = std::path::Path::new(&s.gerber_set);
+            assert_eq!(set.file_name().map(|n| n.to_string_lossy().into_owned()).as_deref(), Some("b"), "the set written last: {}", s.gerber_set);
+            assert_eq!(set.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).as_deref(), Some("mfg"));
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("rail_sources: {ms:.2} ms an ask (a board, a sheet, 5 mech parts, 24 Gerbers in 2 sets)");
+        assert!(ms < 20.0, "rails for every picture should not cost a picture ({ms:.2} ms)");
+    }
     fn files_world(tag: &str) -> (State, String, crate::plat::tmp::TempDir) {
         let d = crate::plat::tmp::canonical(&format!("fm-pres-{tag}")); std::fs::create_dir_all(d.join("docs/deep")).unwrap(); std::fs::create_dir_all(d.join("mech")).unwrap();
         for (f, c) in [("notes.md", "# n"), ("a.kicad_pcb", "(kicad_pcb)"), ("pic.png", "x"), ("doc.pdf", "x"), ("m.step", "x"), ("plain.bin", "x"), ("docs/a.txt", "a"), (".env", "k"), ("docs/server.key", "k")] { std::fs::write(d.join(f), c).unwrap(); }
