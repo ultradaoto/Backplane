@@ -71,7 +71,7 @@ impl Call for Patient<'_> {
 pub fn net_match(p: &str, n: &str) -> bool { glob(p, n) || (!p.starts_with('/') && n.starts_with('/') && !n[1..].contains('/') && glob(p, &n[1..])) }
 /// Whether the ops change anything (a call of finds and raw reads alone does not).
 pub fn writes(ops: &Value) -> bool {
-    ops.as_array().into_iter().flatten().any(|o| match verb(o) { "find" | "" => false, "ipc" => !super::ipc::is_read(&full_type(o["ipc"]["type"].as_str().unwrap_or(""))), _ => true })
+    ops.as_array().into_iter().flatten().any(|o| match verb(o) { "find" | "check" | "" => false, "ipc" => !super::ipc::is_read(&full_type(o["ipc"]["type"].as_str().unwrap_or(""))), _ => true })
 }
 /// What a writing call is answered while the person works in this KiCad and the call does not say it has seen that (`person_seen`):
 /// the agent asks before working over them, as it does after a `kicad_ipc` read shows `person` (docs/kicad-coedit.md).
@@ -683,7 +683,7 @@ fn kind_of(raw: &Value) -> &'static str {
     }
 }
 
-fn verb(op: &Value) -> &str { const V: &[&str] = &["find", "move", "set", "add", "delete", "ipc", "netclass", "rule", "refill", "route", "place"]; op.as_object().and_then(|o| V.iter().find(|v| o.contains_key(**v))).copied().unwrap_or("") }
+fn verb(op: &Value) -> &str { const V: &[&str] = &["find", "move", "set", "add", "delete", "ipc", "netclass", "rule", "refill", "route", "place", "check"]; op.as_object().and_then(|o| V.iter().find(|v| o.contains_key(**v))).copied().unwrap_or("") }
 /// A selector from an op's target: an object as it is; text or a list of texts are references of the document's parts.
 fn selector(target: &Value, board: bool) -> Value {
     if target.is_object() { let mut t = target.clone(); if t["kind"].is_null() { t["kind"] = json!(if board { "footprint" } else { "symbol" }) } t }
@@ -942,7 +942,7 @@ impl Run<'_> {
     async fn op(&mut self, i: usize, op: &Value) -> Result<Value, String> {
         // what the check's `new` is about: the nets a route names, the parts placed, moved or set by reference, a new track's net; anything else
         // (a delete, a rule, a selector) has no such list, and then every new finding is this edit's
-        match verb(op) { "find" | "route" | "place" => {}
+        match verb(op) { "find" | "route" | "place" | "check" => {}
             v @ ("move" | "set") => match &op[v] { Value::String(r) => self.touched.push(r.clone()), Value::Array(a) => self.touched.extend(a.iter().filter_map(|x| x.as_str().map(str::to_string))), _ => self.touch_all = true },
             "add" => for it in match &op["add"] { Value::Array(a) => a.clone(), o => vec![o.clone()] } { match it["track"]["net"].as_str().or(it["via"]["net"].as_str()).or(it["symbol"]["ref"].as_str()) { Some(n) if !n.is_empty() => self.touched.push(n.to_string()), _ => self.touch_all = true } },
             _ => self.touch_all = true }
@@ -1200,6 +1200,49 @@ impl Run<'_> {
                 let mut out = json!({"routed": routed}); if ripped > 0 { out["ripped_up"] = json!(ripped) } if !crossing.is_empty() { out["rerouted_off_the_pads"] = json!(crossing) } if trimmed > 0 { out["old_stubs_trimmed"] = json!(trimmed) } if whole > 0 { out["already_connected"] = json!(whole) } if !failed.is_empty() { out["failed"] = json!(failed) }
                 Ok(out)
             }
+            // Check.kedit: a dry run of planned copper against the board's own numbers (kroute::check_item): what it would violate,
+            // before a track is created. Nothing is written, and KiCad's own DRC stays the judge of what the model does not know.
+            "check" => {
+                if !self.board { return Err("check checks a board's clearances: give a .kicad_pcb".into()) }
+                use super::kroute as kr;
+                let c = &op["check"];
+                let (board, classes) = self.model().await?;
+                let tracks = c["tracks"].as_array().cloned().unwrap_or_default();
+                let vias = c["vias"].as_array().cloned().unwrap_or_default();
+                if tracks.is_empty() && vias.is_empty() { return Err("check takes tracks: [{a: [x, y], b: [x, y], width, net, layer}] and/or vias: [{at: [x, y], size, drill, net}] in millimetres".into()) }
+                let num = |v: f64| (v * 1000.0).round() / 1000.0;
+                let viol = |vs: &[kr::Viol]| json!(vs.iter().map(|v| json!({"against": v.against, "need": num(v.need), "actual": num(v.actual), "at": [num(v.at.0), num(v.at.1)]})).collect::<Vec<_>>());
+                let mut rows = vec![];
+                for (i, t) in tracks.iter().enumerate() {
+                    let (ax, ay) = pair(&t["a"]).ok_or(format!("check's track {}: a is [x, y] in mm", i + 1))?;
+                    let (bx, by) = pair(&t["b"]).ok_or(format!("check's track {}: b is [x, y] in mm", i + 1))?;
+                    let net = t["net"].as_str().unwrap_or("").to_string();
+                    let lname = t["layer"].as_str().unwrap_or("");
+                    let li = board.layer(lname).ok_or(format!("check's track {}: layer `{}` is none of this board's copper layers ({})", i + 1, lname, board.layers.join(", ")))?;
+                    let width = t["width"].as_f64().filter(|w| *w > 0.0).unwrap_or_else(|| mm(&classes[&net]["board"]["track_width"]["value_nm"]));
+                    if width <= 0.0 { return Err(format!("check's track {}: no track width for `{net}` (its net class says none): give width", i + 1)) }
+                    let shape = kr::Shape::Capsule(kr::P(ax, ay), kr::P(bx, by), width / 2.0);
+                    let vs = kr::check_item(&board, &shape, 1 << li, &net, kr::Kind::Track, 0.0);
+                    let mut o = json!({"check": i + 1, "what": "track", "net": net, "layer": lname, "width": num(width), "clearance": num(board.net_clearance(&net)), "ok": vs.is_empty()});
+                    if net.is_empty() { o["note"] = json!("no net: the board's minimum clearance kept") }
+                    if !vs.is_empty() { o["violations"] = viol(&vs) }
+                    rows.push(o);
+                }
+                for (i, v) in vias.iter().enumerate() {
+                    let (x, y) = pair(&v["at"]).ok_or(format!("check's via {}: at is [x, y] in mm", i + 1))?;
+                    let size = v["size"].as_f64().filter(|s| *s > 0.0).ok_or(format!("check's via {}: size is its pad's diameter in mm", i + 1))?;
+                    let drill = v["drill"].as_f64().unwrap_or(0.0);
+                    let net = v["net"].as_str().unwrap_or("").to_string();
+                    let layers = match v["layers"].as_array() { Some(ls) => ls.iter().filter_map(|l| l.as_str().and_then(|l| board.layer(l))).fold(0u64, |m, i| m | 1 << i), None => (1u64 << board.layers.len()) - 1 };
+                    let shape = kr::Shape::Circle(kr::P(x, y), size / 2.0);
+                    let vs = kr::check_item(&board, &shape, layers, &net, kr::Kind::Via, drill);
+                    let mut o = json!({"check": i + 1, "what": "via", "net": net, "at": [num(x), num(y)], "size": num(size), "clearance": num(board.net_clearance(&net)), "ok": vs.is_empty()});
+                    if net.is_empty() { o["note"] = json!("no net: the board's minimum clearance kept") }
+                    if !vs.is_empty() { o["violations"] = viol(&vs) }
+                    rows.push(o);
+                }
+                Ok(json!({"checks": rows}))
+            }
             "place" => {
                 use super::kroute as kr;
                 let pairs: Vec<(String, String)> = match &op["place"] { Value::Object(o) => o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(), Value::String(s) => vec![(s.clone(), op["near"].as_str().unwrap_or("").to_string())], _ => vec![] };
@@ -1390,7 +1433,7 @@ mod tests {
     }
 
     /// A stand-in KiCad: a board with two footprints, a track and a zone; it records every command.
-    struct Fake { log: Mutex<Vec<(String, Value)>>, open: Mutex<bool>, fail: Option<&'static str>, busy: Mutex<u32>, save: Value, texts: Option<Vec<String>>, caps: Vec<String>, served: Option<&'static str>, zones: Option<Value>, libs: Option<Mutex<Libs>> }
+    struct Fake { log: Mutex<Vec<(String, Value)>>, open: Mutex<bool>, fail: Option<&'static str>, busy: Mutex<u32>, save: Value, texts: Option<Vec<String>>, caps: Vec<String>, served: Option<&'static str>, zones: Option<Value>, libs: Option<Mutex<Libs>>, board_rules: bool }
     /// Footprint libraries loading as in the live editor (#1204's sibling, b5 Fix 1): each library's status before and from its poll `at`
     /// of GetLibraryStatuses, and the footprints it has; KiCad answers "not found" for a footprint until its library is LOADED.
     struct LibRow { kind: &'static str, nick: &'static str, before: &'static str, after: &'static str, at: u32, has: &'static [&'static str] }
@@ -1429,6 +1472,10 @@ mod tests {
                 "GetLibraryStatuses" if self.libs.is_some() => { let mut l = self.libs.as_ref().unwrap().lock().unwrap(); l.polls += 1; let p = l.polls;
                     json!({"libraries": l.rows.iter().map(|r| { let st = r.now(p); let mut e = json!({"entry": {"nickname": r.nick, "type": r.kind, "scope": "LTS_GLOBAL"}, "status": st}); if st == "LLS_ERROR" { e["error_message"] = json!("cannot read /x/A.pretty") } e }).collect::<Vec<_>>()}) }
                 "DeleteItems" => json!({"deleted_items": msg["item_ids"].as_array().unwrap().iter().map(|i| json!({"id": i, "status": "IDS_OK"})).collect::<Vec<_>>()}),
+                // a small board's own numbers, for the check op's model (two copper layers, 0.15 min clearance, 0.3 to the edge and the holes)
+                "GetBoardEnabledLayers" if self.board_rules => json!({"layers": ["BL_F_Cu", "BL_B_Cu"]}),
+                "GetBoardDesignRules" if self.board_rules => json!({"rules": {"constraints": {"min_clearance": {"value_nm": "150000"}, "copper_edge_clearance": {"value_nm": "300000"}, "hole_clearance": {"value_nm": "300000"}}}}),
+                "GetNetClassForNets" if self.board_rules => json!({"classes": {}}),
                 _ => json!({}),
             })
         }) }
@@ -1436,7 +1483,7 @@ mod tests {
         fn caps(&self) -> Vec<String> { self.caps.clone() }
         fn served(&self) -> Option<&'static str> { self.served }
     }
-    fn fake(fail: Option<&'static str>) -> Fake { Fake { log: Mutex::new(vec![]), open: Mutex::new(false), fail, busy: Mutex::new(0), save: json!({}), texts: None, caps: vec![], served: None, zones: None, libs: None } }
+    fn fake(fail: Option<&'static str>) -> Fake { Fake { log: Mutex::new(vec![]), open: Mutex::new(false), fail, busy: Mutex::new(0), save: json!({}), texts: None, caps: vec![], served: None, zones: None, libs: None, board_rules: false } }
     fn names(f: &Fake) -> Vec<String> { f.log.lock().unwrap().iter().map(|(t, _)| t.clone()).collect() }
     fn sent(f: &Fake, ty: &str) -> Value { f.log.lock().unwrap().iter().find(|(t, _)| t == ty).map(|(_, m)| m.clone()).unwrap_or(Value::Null) }
     fn go(f: &Fake, a: Value) -> Result<Value, String> { go_on(f, "/p/b.kicad_pcb", a) }
@@ -1776,6 +1823,36 @@ mod tests {
         assert_eq!((out["check"].clone(), *c.1.lock().unwrap()), (json!({"by": "KiCad's DRC of the saved board, schematic parity included", "new": [], "left": 1, "elsewhere": {"count": 1, "first": ["clearance: Track [GND]"], "note": "on items this edit did not work on: a refill or the file's first save moves such findings about; they are this edit's only if its copper cut a pour there"}}), 2), "R1 was moved: a finding that does not name R1 is set apart, not hidden");
         let c = Checked(fake(None), Mutex::new(0)); let out = rt().block_on(run(&c, "/p/b.kicad_pcb", &json!({"ops": [{"find": "footprint"}]}))).unwrap(); assert_eq!((out.get("check"), *c.1.lock().unwrap()), (None, 0));
         let c = Checked(fake(None), Mutex::new(0)); rt().block_on(run(&c, "/p/b.kicad_pcb", &json!({"ops": [{"move": "R1", "by": [1, 0]}], "check": false}))).unwrap(); assert_eq!(*c.1.lock().unwrap(), 0);
+    }
+    /// Check.kedit: a planned track's clearances answered against the board's own numbers, before anything is created.
+    /// (the fixture's GND track runs (146.2, 112.4) - (153.8, 112.4), 0.2 wide, on F.Cu)
+    #[test] fn the_check_op_says_what_a_planned_track_would_violate() {
+        let mut f = fake(None); f.board_rules = true;
+        // 0.10 between the surfaces (centres 0.3 apart, radii 0.1 + 0.1): a violation naming the GND track, at the nearest point
+        let out = go(&f, json!({"ops": [{"check": {"tracks": [
+            {"a": [147.0, 112.7], "b": [152.0, 112.7], "width": 0.2, "net": "/SDA", "layer": "F.Cu"},
+            {"a": [147.0, 120.0], "b": [152.0, 120.0], "width": 0.2, "net": "/SDA", "layer": "F.Cu"}]}}]})).unwrap();
+        let rows = out["results"][0]["checks"].as_array().unwrap_or_else(|| panic!("{out}"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0]["what"].clone(), rows[0]["net"].clone(), rows[0]["layer"].clone()), (json!("track"), json!("/SDA"), json!("F.Cu")));
+        assert!(!rows[0]["ok"].as_bool().unwrap(), "{}", rows[0]);
+        let v = &rows[0]["violations"][0];
+        assert_eq!(v["against"], "track [GND]");
+        assert_eq!(v["need"], json!(0.15), "/SDA has no class: the board's minimum");
+        assert!((v["actual"].as_f64().unwrap() - 0.10).abs() < 0.01, "{v}");
+        assert!((v["at"][1].as_f64().unwrap() - 112.6).abs() < 0.02, "the nearest point on the planned track: {v}");
+        assert!(rows[1]["ok"].as_bool().unwrap(), "{}", rows[1]);
+        assert_eq!(rows[1]["clearance"], json!(0.15));
+        // the width comes from the net's class when the check gives none (none here): said, and refused without one
+        let e = go(&f, json!({"ops": [{"check": {"tracks": [{"a": [0, 0], "b": [1, 0], "net": "/X", "layer": "F.Cu"}]}}]})).unwrap_err();
+        assert!(e.contains("no track width"), "{e}");
+        // a via's copper over the trace: 0.0 apart, said with the place
+        let out = go(&f, json!({"ops": [{"check": {"vias": [{"at": [150.0, 112.4], "size": 0.6, "net": "/SDA"}, {"at": [150.0, 118.0], "size": 0.6, "net": "/SDA"}]}}]})).unwrap();
+        let rows = out["results"][0]["checks"].as_array().unwrap();
+        assert!(!rows[0]["ok"].as_bool().unwrap()); assert_eq!(rows[0]["violations"][0]["actual"], json!(0.0));
+        assert!(rows[1]["ok"].as_bool().unwrap(), "{}", rows[1]);
+        // a read-only op: no commit, no save, nothing written
+        assert!(!names(&f).iter().any(|n| n == "BeginCommit" || n == "SaveDocument"), "{:?}", names(&f));
     }
     #[test] fn raw_commands_run_in_order_with_the_document_filled_in() {
         let f = fake(None);

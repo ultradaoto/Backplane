@@ -249,6 +249,74 @@ pub fn push_out(a: &[P], b: &[P]) -> Option<P> {
     Some(P(ax.0 * depth * sign, ax.1 * depth * sign))
 }
 
+// ---- Check.kroute: a proposed copper item against the board (kicad_edit's `check` op) ---------------------
+
+/// One clearance violation: what it is against, the clearance the pair keeps, the distance found, where (mm).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Viol { pub against: String, pub need: f64, pub actual: f64, pub at: P }
+
+/// What an item of the board is called in a check's answer.
+fn describe(it: &Item) -> String {
+    match it.kind {
+        Kind::Pad if it.net.is_empty() => format!("pad {} of {}", it.of.1, it.of.0),
+        Kind::Pad => format!("pad {} [{}] of {}", it.of.1, it.net, it.of.0),
+        Kind::Track if it.net.is_empty() => "a copper shape".into(),
+        Kind::Track => format!("track [{}]", it.net),
+        Kind::Via => format!("via [{}]", it.net),
+        Kind::Hole => "a hole".into(),
+        Kind::Edge => "the board edge".into(),
+        Kind::KeepTracks => "a keep-out for tracks".into(),
+        Kind::KeepVias => "a keep-out for vias".into(),
+    }
+}
+
+/// Whether a proposed copper item (a track's capsule or a via's circle, `kicad_edit`'s `check` op)
+/// keeps the board's clearances: the violations, nearest first, 8 at most. Same-net copper is allowed
+/// (it connects); the edge and the holes keep the board's own numbers; a keep-out must not be
+/// overlapped at all; a via's drill keeps the hole clearance to the holes (KiCad's hole_to_hole; the
+/// model's pads carry no drill, so a pad's own hole is KiCad's DRC's to say, as every rule the model
+/// does not know — the check is the model's, the judge KiCad's).
+pub fn check_item(b: &Board, shape: &Shape, layers: u64, net: &str, kind: Kind, drill: f64) -> Vec<Viol> {
+    let own = b.net_clearance(net);
+    let pts = shape.samples(0.05);
+    let mut out: Vec<Viol> = vec![];
+    for o in &b.items {
+        if o.layers & layers == 0 { continue }
+        if !net.is_empty() && o.net == net && matches!(o.kind, Kind::Pad | Kind::Track | Kind::Via) && matches!(kind, Kind::Pad | Kind::Track | Kind::Via) { continue }
+        if matches!(o.kind, Kind::KeepTracks | Kind::KeepVias) {
+            if (o.kind == Kind::KeepVias) != (kind == Kind::Via) { continue }
+            // copper in the keep-out: a sample of the copper's surface inside or on it
+            if pts.iter().any(|q| o.shape.dist(*q) <= 1e-9) { out.push(Viol { against: describe(o), need: 0.0, actual: 0.0, at: pts[0] }) }
+            continue;
+        }
+        let need = b.clr(own, o);
+        // the shapes' boxes a clearance apart in x or y: nothing to measure
+        let (ax0, ay0, ax1, ay1) = shape.bbox(); let (bx0, by0, bx1, by1) = o.shape.bbox();
+        if ax0 - bx1 >= need || bx0 - ax1 >= need || ay0 - by1 >= need || by0 - ay1 >= need { continue }
+        let against = describe(o);
+        let mut worst: Option<Viol> = None;
+        let mut see = |d: f64, at: P| if d < need - 1e-9 && worst.as_ref().map_or(true, |w| d < w.actual) { worst = Some(Viol { against: against.clone(), need, actual: d, at }) };
+        for q in &pts { see(o.shape.dist(*q), *q) }
+        for q in o.shape.samples(0.05) { see(shape.dist(q), q) }
+        if let Some(v) = worst { out.push(v) }
+    }
+    if drill > 0.0 {
+        if let Shape::Circle(c, _) = shape {
+            let dsh = Shape::Circle(*c, drill / 2.0);
+            for o in b.items.iter().filter(|o| o.kind == Kind::Hole) {
+                let need = b.hole_clearance;
+                if need <= 0.0 { break }
+                let mut worst: Option<Viol> = None;
+                for q in dsh.samples(0.05) { let d = o.shape.dist(q); if d < need - 1e-9 && worst.as_ref().map_or(true, |w| d < w.actual) { worst = Some(Viol { against: describe(o), need, actual: d, at: q }) } }
+                if let Some(v) = worst { out.push(v) }
+            }
+        }
+    }
+    out.sort_by(|a, z| a.actual.partial_cmp(&z.actual).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(8);
+    out
+}
+
 // ---- the router ------------------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -534,6 +602,46 @@ mod tests {
         assert_eq!(hull(&[P(0.0, 0.0), P(1.0, 0.0), P(1.0, 1.0), P(0.0, 1.0), P(0.5, 0.5)]).len(), 4);
         let sq = |x: f64| vec![P(x, 0.0), P(x + 1.0, 0.0), P(x + 1.0, 1.0), P(x, 1.0)];
         assert!(overlap(&sq(0.0), &sq(0.5)) && !overlap(&sq(0.0), &sq(1.2)));
+    }
+    /// Check.kroute: a planned copper item against the board's own numbers.
+    #[test] fn a_check_says_what_a_planned_track_would_violate() {
+        let other = Item { shape: Shape::Capsule(P(0.0, 0.0), P(10.0, 0.0), 0.1), layers: 1, net: "A".into(), kind: Kind::Track, of: Default::default(), smd: false };
+        let b = board(vec![other]);
+        // 0.10 between the surfaces (centres 0.35 apart, radii 0.1 + 0.2): a violation naming the track, at the nearest point
+        let v = check_item(&b, &Shape::Capsule(P(0.0, 0.35), P(10.0, 0.35), 0.2), 1, "B", Kind::Track, 0.0);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].against, "track [A]"); assert!((v[0].need - 0.15).abs() < 1e-9);
+        assert!((v[0].actual - 0.05).abs() < 1e-6, "{}", v[0].actual); assert!((v[0].at.1 - 0.15).abs() < 1e-6);
+        // 0.35 between the surfaces: clean, and the clearance the pair keeps is the board's minimum
+        assert!(check_item(&b, &Shape::Capsule(P(0.0, 0.55), P(10.0, 0.55), 0.2), 1, "B", Kind::Track, 0.0).is_empty());
+        // its own net's copper is allowed: it connects
+        assert!(check_item(&b, &Shape::Capsule(P(0.0, 0.15), P(10.0, 0.15), 0.2), 1, "A", Kind::Track, 0.0).is_empty());
+        // another copper layer: nothing to measure
+        assert!(check_item(&b, &Shape::Capsule(P(0.0, 0.35), P(10.0, 0.35), 0.2), 2, "B", Kind::Track, 0.0).is_empty());
+    }
+    #[test] fn a_check_keeps_the_boards_own_numbers_for_the_edge_the_holes_and_the_keepouts() {
+        let edge = Item { shape: Shape::Capsule(P(-1.0, -5.0), P(-1.0, 5.0), 0.0), layers: 1, net: String::new(), kind: Kind::Edge, of: Default::default(), smd: false };
+        let hole = Item { shape: Shape::Circle(P(5.0, 0.0), 0.3), layers: 1, net: String::new(), kind: Kind::Hole, of: Default::default(), smd: false };
+        let keep = Item { shape: Shape::Poly(vec![P(8.0, -1.0), P(10.0, -1.0), P(10.0, 1.0), P(8.0, 1.0)]), layers: 1, net: String::new(), kind: Kind::KeepTracks, of: Default::default(), smd: false };
+        let b = Board { layers: vec!["F.Cu".into()], items: vec![edge, hole, keep], min_clearance: 0.15, edge_clearance: 0.3, hole_clearance: 0.3, ..Default::default() };
+        // 0.2 of copper surface to the edge's line (centre 0.3 from it, the track 0.2 wide = radius 0.1): the board's own 0.3 is what is kept, not the net's 0.15
+        let v = check_item(&b, &Shape::Capsule(P(-0.7, 0.0), P(4.0, 0.0), 0.1), 1, "A", Kind::Track, 0.0);
+        assert_eq!(v.len(), 1, "{v:?}"); assert_eq!(v[0].against, "the board edge"); assert!((v[0].need - 0.3).abs() < 1e-9);
+        assert!((v[0].actual - 0.2).abs() < 1e-6, "{}", v[0].actual);
+        // the same track clear of the edge, but over the hole: copper-to-hole at the hole clearance
+        let v = check_item(&b, &Shape::Capsule(P(0.0, 0.0), P(4.6, 0.0), 0.1), 1, "A", Kind::Track, 0.0);
+        assert!(v.iter().any(|x| x.against == "a hole" && (x.need - 0.3).abs() < 1e-9), "{v:?}");
+        // a keep-out for tracks: crossing it is a violation at 0, passing beside it is none, and a via does not care about this one
+        let across = check_item(&b, &Shape::Capsule(P(6.0, 0.0), P(9.0, 0.0), 0.1), 1, "A", Kind::Track, 0.0);
+        assert!(across.iter().any(|x| x.against == "a keep-out for tracks" && x.actual == 0.0), "{across:?}");
+        let beside = check_item(&b, &Shape::Capsule(P(0.0, 2.0), P(9.0, 2.0), 0.2), 1, "A", Kind::Track, 0.0);
+        assert!(!beside.iter().any(|x| x.against.contains("keep-out")), "{beside:?}");
+        let via = check_item(&b, &Shape::Circle(P(9.0, 3.0), 0.3), 1, "A", Kind::Via, 0.15);
+        assert!(!via.iter().any(|x| x.against.contains("keep-out")), "{via:?}");
+        // a via's drill keeps the hole clearance to the holes (hole to hole), its copper the copper's
+        let v = check_item(&b, &Shape::Circle(P(5.6, 0.0), 0.4), 1, "A", Kind::Via, 0.4);
+        assert!(v.iter().any(|x| x.against == "a hole" && x.actual < 0.3), "{v:?}");
+        assert!(check_item(&b, &Shape::Circle(P(7.0, 0.0), 0.4), 1, "A", Kind::Via, 0.4).iter().all(|x| x.against != "a hole"));
     }
     #[test] fn routes_two_pads_around_a_third() {
         let mut b = board(vec![pad("R1", "1", "A", P(0.0, 0.0), 0.2, 0.2, 0.0), pad("R2", "1", "A", P(4.0, 0.0), 0.2, 0.2, 0.0), pad("X", "1", "B", P(2.0, 0.0), 0.3, 1.0, 0.0)]);
