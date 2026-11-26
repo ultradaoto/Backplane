@@ -113,7 +113,10 @@ impl Cx {
                     out.push(json!({"$":"ActivityLogged","thread":self.thread,"act":id,"tone":"tool","kind":name,"summary":summary,"at":at}));
                     self.sub_about(b, at, out);
                 }
-                "thinking" if self.think && !s(b, "thinking").trim().is_empty() =>
+                // a thinking row whenever the CLI said what the model thought (always, with --thinking-display summarized): a
+                // turn that thinks for minutes before its first tool is not silence in the thread. Empty blocks (a CLI without
+                // the flag, an off dial's old process) stay unshown.
+                "thinking" if !s(b, "thinking").trim().is_empty() =>
                     out.push(json!({"$":"ActivityLogged","thread":self.thread,"act":format!("think:{msg}:{i}{}", uid(uuid)),"tone":"thinking","kind":"thinking","summary":s(b, "thinking"),"at":at})),
                 _ => {}
             }
@@ -507,6 +510,18 @@ mod tests {
     }
     #[test] fn claude_result_after_stop_quiet() { let mut c = Cx::new("t1"); assert!(run(&mut c, r#"{"type":"result","is_error":false}"#).events.is_empty()); }
     #[test] fn claude_delta_after_stop_quiet() { let mut c = Cx::new("t1"); assert!(run(&mut c, r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"late"}}}"#).deltas.is_empty()); }
+    /// The thought is shown whatever the thinking dial says (the CLI is started with --thinking-display summarized): a turn that
+    /// thinks for minutes before its first tool is not silence. An empty block (an old process of a CLI without the flag) is not.
+    #[test] fn a_thought_is_a_row_with_the_dial_off_and_an_empty_one_is_not() {
+        let mut c = Cx::new("t1"); c.running = true;
+        let a = run(&mut c, r#"{"type":"assistant","uuid":"abcdef0123456789","message":{"id":"m1","content":[{"type":"thinking","thinking":"I'm reading the board first."}]}}"#);
+        assert_eq!(a.events[0]["$"], "ActivityLogged"); assert_eq!(a.events[0]["tone"], "thinking"); assert_eq!(a.events[0]["kind"], "thinking");
+        assert_eq!(a.events[0]["act"], "think:m1:0:abcdef01"); assert_eq!(a.events[0]["summary"], "I'm reading the board first.");
+        let empty = run(&mut c, r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"thinking","thinking":""}]}}"#);
+        assert!(empty.events.is_empty(), "nothing the CLI did not say");
+        let spaced = run(&mut c, r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"thinking","thinking":"  "}]}}"#);
+        assert!(spaced.events.is_empty());
+    }
     #[test] fn a_running_turns_tokens_are_told_after_each_model_call_and_cleared_by_its_result() {
         let mut c = Cx::new("t1"); c.running = true; c.models = "claude-fable-5-2|1000|100|10000|0|2000000000|0|1000000".into();
         let live = |fx: &Fx| fx.events.iter().find(|e| e["key"] == "turn.live.t1").map(|e| e["value"].as_str().unwrap().to_string());

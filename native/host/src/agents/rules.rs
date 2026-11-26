@@ -51,7 +51,11 @@ pub fn claude_args(a: &ArgsIn) -> Vec<String> {
     if !a.session.is_empty() { v.push(s("--resume")); v.push(s(a.session)); }
     for d in a.dirs { v.push(s("--add-dir")); v.push(s(d)); }
     if effort_ok(a.effort) { v.push(s("--effort")); v.push(s(a.effort)); }
-    if a.think { v.push(s("--thinking-display")); v.push(s("summarized")); }
+    // The CLI's default display ("updates") ships the thinking block empty (a signature alone), so a thinking-heavy turn reads as
+    // silence in the thread. "summarized" asks for Anthropic's own summary of the thought — the same thinking, already generated
+    // and billed, now said in the stream (agents/lines.rs posts it as the turn's thinking rows). Always on, whatever the
+    // thinking dial says: the dial decides nothing else for Claude (effort decides the budget).
+    v.push(s("--thinking-display")); v.push(s("summarized"));
     for d in a.plugins { v.push(s("--plugin-dir")); v.push(s(d)); }
     v.push(s("--settings")); v.push(super::speed::claude_settings(a.speed));
     v.push(s("--strict-mcp-config"));
@@ -271,12 +275,15 @@ mod tests {
     #[test] fn modes_map_to_claudes_permission_flags() {
         assert_eq!(permission("full-access", "default"), "bypassPermissions"); assert_eq!(permission("approval-required", "default"), "default"); assert_eq!(permission("full-access", "plan"), "plan");
         let mk = |m: &'static str, s: &'static str, r: &'static str| ArgsIn { model: m, session: s, runtime: r, interaction: "default", prompt: "P", dirs: &[], effort: "", think: false, plugins: &[], mcp_url: "http://u", mcp_json: "", disallowed: &[], speed: "" };
-        let a = claude_args(&mk("opus", "S", "full-access")); assert!(!a.contains(&"--permission-prompt-tool".to_string())); assert_eq!(&a[a.len() - 9..a.len() - 5], ["--model", "opus", "--resume", "S"]);
+        let a = claude_args(&mk("opus", "S", "full-access")); assert!(!a.contains(&"--permission-prompt-tool".to_string())); assert_eq!(&a[a.len() - 11..a.len() - 7], ["--model", "opus", "--resume", "S"], "the thinking display's two words sit after the session");
+        assert!(a.windows(2).any(|w| w == ["--thinking-display", "summarized"]), "the CLI's own summary of the thought, whatever the dial says (an off dial's default display ships the block empty: the turn reads as silence)");
         assert_eq!(&a[a.len() - 5..a.len() - 3], ["--settings", r#"{"fastMode":false}"#], "Normal says fast mode off, whatever the person's own settings saved");
         let mut f = mk("opus", "", "full-access"); f.speed = "fast"; let fa = claude_args(&f); assert_eq!(fa[fa.len() - 4], r#"{"fastMode":true}"#);
         assert!(claude_args(&mk("", "", "auto")).contains(&"--permission-prompt-tool".to_string()));
         let mut x = mk("", "", "full-access"); let dirs = vec!["/k".to_string(), "/h/attachments".to_string()]; x.dirs = &dirs; x.effort = "high"; x.think = true; x.plugins = &dirs[..1];
         let a = claude_args(&x); assert_eq!(&a[a.len() - 15..a.len() - 5], ["--add-dir", "/k", "--add-dir", "/h/attachments", "--effort", "high", "--thinking-display", "summarized", "--plugin-dir", "/k"]); assert_eq!(a[a.len() - 2], "--mcp-config");
+        let mut y = mk("", "", "full-access"); y.effort = "high"; // the dial off: the flag is there all the same
+        assert!(claude_args(&y).windows(2).any(|w| w == ["--thinking-display", "summarized"]));
     }
     #[test] fn the_restart_note_reads_the_person_zone() {
         assert_eq!(clock("", 0), "00:00"); assert_eq!(clock("UTC", 3600 * 5 + 60 * 7), "05:07");
