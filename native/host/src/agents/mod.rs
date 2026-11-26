@@ -1195,7 +1195,8 @@ impl Actor {
         // the speed dial too: a thread turned to Fast starts Claude again at its next turn with fast mode in its settings, on the same session
         let model = crate::settings::models::sanitize_model_now("claude", &t.model);
         let want = self.ag.world().await.setting(&format!("speed.{th}")).to_string(); let tier = speed::effective(&speed::info_now(), "claude", &model, &want);
-        let key = format!("{}|speed:{tier}|mcp:{}{}", rules::agent_key(&model, &t.runtime, &t.interaction, self.cx.think), crate::mcpx::svc::fingerprint(&th, "claude", &cwd).await, if self.ag.in_review(&th).await { "|review" } else { "" }); // a review runs with deny rules for design files (snapguard.rs): a change of mode starts Claude again
+        let key = format!("{}|speed:{tier}|mcp:{}{}|cli:{}", rules::agent_key(&model, &t.runtime, &t.interaction, self.cx.think), crate::mcpx::svc::fingerprint(&th, "claude", &cwd).await, if self.ag.in_review(&th).await { "|review" } else { "" }, // a review runs with deny rules for design files (snapguard.rs): a change of mode starts Claude again
+            if self.person { self.person_prog("claude").map(|p| proc::path_stamp(&p)).unwrap_or_default() } else { self.ag.cli.cli_stamp("claude") }); // a CLI updated while the hub runs starts again at its next turn
         self.tier_set(&th, tier, now).await; self.cx.tier_want = tier.to_string(); self.cx.tier = tier.to_string();
         // a live process with a command still open (a turn in flight) is never replaced for a changed model/mode key: the message goes on its input (the CLI queues it) and the new key applies from the next process
         // infinite context (agents/recall.rs): a new turn (no command open: a message into a running turn goes on its input) starts a fresh session with the view

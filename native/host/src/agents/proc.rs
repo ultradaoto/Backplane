@@ -49,6 +49,23 @@ impl Cli {
             None => std::env::join_paths(search_dirs()).ok(),
         }
     }
+    /// The CLI's identity for a process-reuse key: its resolved path and its file's mtime and size. A CLI updated while the hub runs (npm
+    /// update, `claude update`) then starts again at the next turn, instead of a long-lived process of the old binary being reused for as
+    /// long as the hub runs. Empty when the CLI cannot be resolved (the spawn fails later and says so).
+    pub fn cli_stamp(&self, cli: &str) -> String {
+        match self.resolve(cli) { Ok(p) => path_stamp(&p), Err(_) => String::new() }
+    }
+}
+/// A file's identity as a key fragment: its path, and its mtime (seconds) and size when it can be read. A missing file's metadata stamps
+/// only its path; the caller fails with a word of its own soon after.
+pub fn path_stamp(p: &Path) -> String {
+    match std::fs::metadata(p) {
+        Ok(m) => {
+            let mt = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            format!("{}|{}|{}", p.display(), mt, m.len())
+        }
+        Err(_) => p.display().to_string(),
+    }
 }
 /// The first of `dirs` that has `cli` as a file (a symlink to one counts), as named there (not canonicalized: a launcher script finds its own install from `$0`).
 /// Windows: also `cli.exe` and npm's `cli.cmd`.
@@ -564,6 +581,19 @@ mod tests {
         std::fs::write(d.join("grok"), "x").unwrap(); assert!(a.resolve("grok").is_err()); // not executable
         let outside = dir("res-out"); script(&outside, "muse", "exit 0"); crate::plat::fs::symlink(outside.join("muse"), d.join("muse")).unwrap();
         assert!(a.resolve("muse").is_err()); // a link out of the folder is refused
+    }
+    /// The CLI stamp in a process-reuse key: the file named with its size and mtime, changing when the CLI is updated, empty for a CLI there is not.
+    #[test] fn a_cli_stamp_changes_when_the_cli_is_updated() {
+        let d = dir("stamp"); let a = Cli::standin(&d);
+        assert_eq!(a.cli_stamp("grok"), "", "a CLI that cannot be resolved stamps nothing (the spawn fails and says so)");
+        script(&d, "claude", "exit 0");
+        let s1 = a.cli_stamp("claude");
+        assert!(s1.contains(&d.join("claude").display().to_string()) && s1.contains('|'), "{s1}");
+        assert_eq!(a.cli_stamp("claude"), s1, "an unchanged CLI stamps the same, so a live process is reused");
+        std::fs::write(d.join("claude"), "#!/bin/sh\nexit 1 # updated in place by its installer\n").unwrap(); // an update: a different size (mtime may keep its second)
+        let s2 = a.cli_stamp("claude");
+        assert_ne!(s2, s1, "{s1} -> {s2}");
+        assert!(path_stamp(&d.join("nothing-here")).contains("nothing-here"), "a missing file still names its path");
     }
     /// Windows: a stand-in folder with `claude.exe` (or `claude.cmd`) alone runs it, as a real install would be found.
     #[cfg(windows)]
