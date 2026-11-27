@@ -776,7 +776,7 @@ fn page(template: &Value, kind: &str, root: &str, drafts: &Value, sel: &str, sou
     let Some(o) = v.as_object_mut() else { return v };
     o.insert("open".into(), json!(kind)); o.insert("key".into(), json!(k));
     // whether the project has fab output for a Gerbers tab (phones list the tab only then; the desktop's rail has it always)
-    if matches!(kind, "board" | "schematic" | "3d") && !root.is_empty() { o.insert("hasGerbers".into(), json!(sources.gerbers)); }
+    if matches!(kind, "board" | "schematic" | "3d") && !root.is_empty() { o.insert("hasGerbers".into(), json!(sources.gerbers())); }
     // the Board page drawing a Gerber set (kicad/gerber): the rail lights Gerbers, the layer list is the set's
     let mut k = k;
     if kind == "board" && !sel.is_empty() && s(drafts, &format!("@view.gerbers:{sel}")) == "1" {
@@ -787,7 +787,7 @@ fn page(template: &Value, kind: &str, root: &str, drafts: &Value, sel: &str, sou
         o.insert("gerbersVsBoard".into(), json!(no_board || raw_file.starts_with(crate::files::kicad::gerber::CMP)));
         // what "Open in GerbView" opens (the set's job, else its files): the desktop offers it where its KiCad has GerbView in process
         let set = crate::files::kicad::gerber::set_of(raw_file);
-        let set = if set.is_empty() { sources.newest.as_ref().map(|(p, _)| p.clone()) }
+        let set = if set.is_empty() { sources.newest().map(|(p, _)| p.clone()) }
             else { viewer_identity::relative(root, set).map(|rel| std::path::Path::new(root).join(rel)) };
         if no_board {
             k.clear();
@@ -809,7 +809,7 @@ fn page(template: &Value, kind: &str, root: &str, drafts: &Value, sel: &str, sou
         if let Some(p) = set {
             shown.path = p.to_string_lossy().into_owned();
             if !sel.contains('~') && !root.is_empty() {
-                let time = sources.newest.as_ref().filter(|(path, _)| path == &p).map(|(_, t)| *t);
+                let time = sources.newest().filter(|(path, _)| path == &p).map(|(_, t)| *t);
                 (files, shown.made_at) = crate::files::kicad::gerber::shown_set(std::path::Path::new(root), &p, time);
             }
         }
@@ -1031,14 +1031,41 @@ pub struct RailSources {
     pub board: bool,
     pub schematic: bool,
     pub mech: bool,
-    pub gerbers: bool,
     pub altium: bool,
     pub pcb: String,
     pub sch: String,
-    pub gerber_set: String,
     docs: Value,
     root_sheet: String,
-    newest: Option<(std::path::PathBuf, std::time::SystemTime)>,
+    root: String,
+    /// The project's newest Gerber set, found when first asked for: its walk (three deep under `mfg`/`gerbers`/`gerber`) is the dear part of a
+    /// picture's rails, and only a page that draws a set asks.
+    gerber: std::cell::OnceCell<GerberSet>,
+    /// Whether the project has fabrication output at all: a presence check that stops at the first fab file, kept once asked (`gerbers`).
+    has: std::cell::OnceCell<bool>,
+}
+
+/// A project's newest Gerber set: whether it has one, its path under the root, and the newest fabrication file in it.
+#[derive(Clone, Default)]
+struct GerberSet { has: bool, set: String, newest: Option<(std::path::PathBuf, std::time::SystemTime)> }
+
+impl RailSources {
+    /// Whether the project has fabrication output (a Gerbers tab on a board, schematic or 3D page, the rail's Gerbers row): a presence check
+    /// that stops at the first fab file, not the walk that names the newest set.
+    pub fn gerbers(&self) -> bool {
+        *self.has.get_or_init(|| !self.root.is_empty() && crate::files::kicad::gerber::has_gerbers(std::path::Path::new(&self.root)))
+    }
+    /// The newest Gerber set's path under the project root ("" when it has none).
+    pub fn gerber_set(&self) -> &str { &self.gerber_found().set }
+    /// The newest Gerber set's path and the newest fabrication file in it.
+    pub fn newest(&self) -> Option<&(std::path::PathBuf, std::time::SystemTime)> { self.gerber_found().newest.as_ref() }
+    fn gerber_found(&self) -> &GerberSet {
+        self.gerber.get_or_init(|| {
+            if self.root.is_empty() { return GerberSet::default() }
+            let newest = crate::files::kicad::gerber::newest_set(std::path::Path::new(&self.root))
+                .map(|(rel, time)| (std::path::Path::new(&self.root).join(rel), time));
+            GerberSet { has: newest.is_some(), set: newest.as_ref().map(|(p, _)| p.to_string_lossy().into_owned()).unwrap_or_default(), newest }
+        })
+    }
 }
 
 pub fn rail_sources(root: &str) -> RailSources {
@@ -1051,6 +1078,7 @@ fn working_file(file: &str) -> &str {
     if file.starts_with("git\t") || file.starts_with("diff\n") { "" } else { file }
 }
 
+/// Test aid: how many times the rail sources were read (a picture must not read them when it has no page that uses them).
 fn rail_sources_for(root: &str, selected: &str, kind: &str, file: &str, sheet: &str) -> RailSources {
     use std::path::Path;
     if root.is_empty() { return RailSources::default(); }
@@ -1069,14 +1097,12 @@ fn rail_sources_for(root: &str, selected: &str, kind: &str, file: &str, sheet: &
     };
     let (pcb, board) = doc(board_path);
     let (sch, schematic) = doc(sheet_path);
-    let newest = crate::files::kicad::gerber::newest_set(Path::new(root)).map(|(rel, time)| (Path::new(root).join(rel), time));
-    let gerber_set = newest.as_ref().map(|(path, _)| path.to_string_lossy().into_owned()).unwrap_or_default();
     let docs = json!({"board":pcb, "hasBoard":board, "sheet":sch, "hasSheet":schematic});
     RailSources {
-        board, schematic, docs, root_sheet,
-        mech: !mech_parts(root).is_empty(), gerbers: newest.is_some(), newest,
+        board, schematic, docs, root_sheet, root: root.to_string(),
+        mech: !mech_parts(root).is_empty(),
         altium: crate::files::kicad::project::is_altium(&files),
-        pcb: files.pcb, sch: files.sch, gerber_set,
+        pcb: files.pcb, sch: files.sch, gerber: std::cell::OnceCell::new(), has: std::cell::OnceCell::new(),
     }
 }
 
@@ -1130,8 +1156,8 @@ pub fn viewer_json(st: &State, template: &Value, session: &Value) -> Option<Valu
     }
     // A restored template can already show the default set before the thread has a page draft.
     if local && v["gerbers"] == true && shown.has.is_none() && !root.is_empty() {
-        shown.has = Some(sources.gerbers);
-        if let Some((path, time)) = &sources.newest {
+        shown.has = Some(sources.gerbers());
+        if let Some((path, time)) = sources.newest() {
             shown.path = path.to_string_lossy().into_owned();
             shown.made_at = time.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
         }
@@ -1143,8 +1169,10 @@ pub fn viewer_json(st: &State, template: &Value, session: &Value) -> Option<Valu
     let mut had_stored_layout = false;
     if !sel.is_empty() {
         let linked = sel.contains('~');
+        // (the Gerber set is read only for a page that draws one: finding it is a walk of the project, the dear part of these rails)
+        let gerber_set = if v["gerbers"] == true { sources.gerber_set() } else { "" };
         let (eff_root_local, default_pcb, default_sch, default_gerber_set) = if local {
-            (root.as_str(), sources.pcb.as_str(), sources.sch.as_str(), sources.gerber_set.as_str())
+            (root.as_str(), sources.pcb.as_str(), sources.sch.as_str(), gerber_set)
         } else { ("", "", "", "") };
         let linked_root = if linked {
             st.threads.get(sel).map(|t| {
@@ -1282,7 +1310,7 @@ pub fn viewer_json(st: &State, template: &Value, session: &Value) -> Option<Valu
         let input = rail::RailInput {
             board: !no_project && sources.board, schematic: !no_project && sources.schematic,
             mech: !no_project && (sources.mech || v["mech"]["parts"].as_array().is_some_and(|p| !p.is_empty())),
-            gerbers: !no_project && v["hasGerbers"].as_bool().unwrap_or(sources.gerbers),
+            gerbers: !no_project && v["hasGerbers"].as_bool().unwrap_or_else(|| sources.gerbers()),
             simulation: !no_project && v["simFrame"].is_string(), altium: !no_project && sources.altium,
             no_project, page, diff: !no_project && pages::diff_on(session, sel),
             present: &present,
@@ -2423,8 +2451,10 @@ fn tile_identity(
     };
     let root_sheet = sources.map(|s| s.root_sheet.as_str()).unwrap_or("");
     let made_at = shown.made_at.or_else(|| {
+        // (only a Gerbers page shows a set's time, and finding the set is a walk of the project: no other page asks)
+        if page != "gerbers" { return None }
         sources
-            .and_then(|s| s.newest.as_ref())
+            .and_then(|s| s.newest())
             .and_then(|(_, t)| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
     });
@@ -2438,7 +2468,7 @@ fn tile_identity(
         root_sheet,
         has_board: sources.map(|s| s.board),
         has_sheet: sources.map(|s| s.schematic),
-        has_set: if source_missing && page == "gerbers" { Some(false) } else { shown.has.or_else(|| sources.map(|s| s.gerbers)) },
+        has_set: if source_missing && page == "gerbers" { Some(false) } else { shown.has.or_else(|| sources.map(|s| s.gerbers())) },
         set: if page == "gerbers" { rel } else { "" },
         made_at: if source_missing { None } else { made_at },
     };
@@ -2446,7 +2476,7 @@ fn tile_identity(
         if r.is_empty() || source_missing { return Some(false) }
         if tile.version.is_some() { return Some(true) }
         if let Some(src) = sources {
-            if page == "gerbers" { return Some(src.gerbers && !source_missing) }
+            if page == "gerbers" { return Some(src.gerbers() && !source_missing) }
             if src.docs["board"] == r { return src.docs["hasBoard"].as_bool() }
             if src.docs["sheet"] == r { return src.docs["hasSheet"].as_bool() }
         }
@@ -2499,7 +2529,10 @@ fn build_tiles_picture(
     let probe = s(viewer, "probe");
     let default_pcb = sources.map(|s| s.pcb.as_str()).unwrap_or("");
     let default_sch = sources.map(|s| s.sch.as_str()).unwrap_or("");
-    let default_gerber_rel = sources.map(|s| layout::sanitize_rel(root, &s.gerber_set)).unwrap_or_default();
+    // A Gerber set's own path is walked for only when this picture has a tile that draws one: it names the watch key and the vanished check.
+    let gerbers_tile = layout.tiles().iter().any(|t| t.kind == PageKind::Gerbers
+        || (t.kind == PageKind::Board && t.overlay.as_ref().is_some_and(|o| o.kind == PageKind::Gerbers)));
+    let default_gerber_rel = if gerbers_tile { sources.map(|s| layout::sanitize_rel(root, s.gerber_set())).unwrap_or_default() } else { String::new() };
     let watch_ctx = layout::WatchContext {
         root: root.to_string(),
         default_pcb: default_pcb.to_string(),
@@ -2534,7 +2567,7 @@ fn build_tiles_picture(
                 tile.source.as_str()
             };
             if set_rel.is_empty() || set_rel == default_gerber_rel {
-                !src.gerbers
+                !src.gerbers()
             } else {
                 !gerber_set_resolved(root, set_rel)
             }
@@ -2638,7 +2671,7 @@ fn build_tiles_picture(
                         o.insert("empty".into(), json!("No board in this project yet"));
                         o.insert("emptyNext".into(), json!("Ask an agent to lay one out."));
                     }
-                    PageKind::Gerbers if !src.gerbers && tile.source.is_empty() => {
+                    PageKind::Gerbers if !src.gerbers() && tile.source.is_empty() => {
                         o.insert("empty".into(), json!("No Gerber files in this project yet"));
                         o.insert("emptyNext".into(), json!("Ask an agent to export fabrication files into mfg/."));
                     }
@@ -2846,7 +2879,8 @@ fn layout_action_inner(
             files_dir: s(drafts, &format!("@files.dir:{sel}")),
             default_pcb: &sources.pcb,
             default_sch: &sources.sch,
-            default_gerber_set: &sources.gerber_set,
+            // (the set is read only where the layout draws one: its walk is the dear part of these rails)
+            default_gerber_set: if s(drafts, &format!("@view.gerbers:{sel}")) == "1" { sources.gerber_set() } else { "" },
         })
     });
 
@@ -2897,7 +2931,7 @@ fn layout_action_inner(
                 match kind {
                     PageKind::Board | PageKind::Solid3d => layout::sanitize_rel(&root, &sources.pcb),
                     PageKind::Schematic | PageKind::Simulation => layout::sanitize_rel(&root, &sources.sch),
-                    PageKind::Gerbers => layout::sanitize_rel(&root, &sources.gerber_set),
+                    PageKind::Gerbers => layout::sanitize_rel(&root, sources.gerber_set()),
                     _ => String::new(),
                 }
             };
@@ -3619,7 +3653,6 @@ mod tests {
         assert!(view_action(&st, "h", &s_open, "review").is_some(), "Review is drawn from the session (session/pages.rs)");
     }
 
-
     fn files_world(tag: &str) -> (State, String, crate::plat::tmp::TempDir) {
         let d = crate::plat::tmp::canonical(&format!("fm-pres-{tag}")); std::fs::create_dir_all(d.join("docs/deep")).unwrap(); std::fs::create_dir_all(d.join("mech")).unwrap();
         for (f, c) in [("notes.md", "# n"), ("a.kicad_pcb", "(kicad_pcb)"), ("pic.png", "x"), ("doc.pdf", "x"), ("m.step", "x"), ("plain.bin", "x"), ("docs/a.txt", "a"), (".env", "k"), ("docs/server.key", "k")] { std::fs::write(d.join(f), c).unwrap(); }
@@ -3735,6 +3768,40 @@ mod tests {
         assert_eq!(viewer_json(&st, &template, &s1).unwrap()["panes"][0]["key"], json!(format!("1|{root}|{alt}")));
         assert!(sheet_action(&st, "h", &s1, &format!("{root}/notes.txt")).is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+    /// What a picture costs to build, per page, as the presenter builds it for every state change (an agent's turn makes many). A picture with
+    /// nothing open, a board or a schematic page asks only whether the project has fabrication output; the walk that names the newest set is
+    /// a Gerbers page's. Printed, and kept loose: a busy machine is slow.
+    #[test] fn a_picture_costs_a_millisecond_and_a_gerbers_page_the_walk_of_its_set() {
+        let (st, th, d) = files_world("pic-measure"); let root = d.to_string_lossy().into_owned();
+        std::fs::write(d.join("rc.kicad_sch"), "(kicad_sch)").unwrap(); std::fs::write(d.join("rc.kicad_pro"), "{}").unwrap();
+        for set in ["mfg/a", "mfg/b"] { std::fs::create_dir_all(d.join(set)).unwrap(); for k in 0..12 { std::fs::write(d.join(set).join(format!("l{k}.gbr")), "G04*").unwrap() } }
+        for k in 0..5 { std::fs::write(d.join(format!("mech/part{k}.step")), "x").unwrap() }
+        let template: Value = serde_json::from_str::<Value>(include_str!("thread_static.json")).unwrap()["viewer"].clone();
+        // the rails find what the project has, and name the set written last
+        let rails = rail_sources(&root);
+        assert!(rails.board && rails.schematic && rails.mech && rails.gerbers(), "the project's board, sheet, mech parts and Gerbers");
+        let set = std::path::Path::new(rails.gerber_set());
+        assert_eq!(set.file_name().map(|n| n.to_string_lossy().into_owned()).as_deref(), Some("b"), "the set written last: {}", rails.gerber_set());
+        assert_eq!(set.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).as_deref(), Some("mfg"));
+        // the two Gerber facts, apart: the presence check every picture asks, and the walk only a Gerbers page asks
+        let n = 50; let t = std::time::Instant::now();
+        for _ in 0..n { assert!(crate::files::kicad::gerber::has_gerbers(std::path::Path::new(&root))) }
+        let presence = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n { assert!(crate::files::kicad::gerber::newest_set(std::path::Path::new(&root)).is_some()) }
+        let walk = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("gerbers: presence check {presence:.3} ms an ask, newest set {walk:.3} ms an ask");
+        assert!(presence < walk, "the presence check must stay the cheap one ({presence:.3} vs {walk:.3} ms)");
+        for page in ["", "board", "schematic", "split", "gerbers"] {
+            let mut s = sess(&th, json!({}));
+            if !page.is_empty() { let o = view_action(&st, "h", &s, page).unwrap(); crate::session::patch::merge(&mut s, &o.patch); }
+            let n = 30; let t = std::time::Instant::now();
+            for k in 0..n { let v = viewer_json(&st, &template, &s).expect("a picture"); assert!(v["open"].as_str().is_some()); drop(v); let _ = k; }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            eprintln!("picture: {:9} {ms:.3} ms", if page.is_empty() { "idle" } else { page });
+            assert!(ms < 40.0, "a picture should not cost 40 ms ({page}: {ms:.3})");
+        }
     }
     fn sess(th: &str, drafts: Value) -> Value { json!({"sel": th, "rid": 1, "drafts": drafts, "open": {}, "adding": false, "panel": false, "info": {}}) }
     #[test] fn the_files_page_lists_rows_trail_and_downloads_as_core_fm_does() {

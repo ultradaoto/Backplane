@@ -918,22 +918,22 @@ async fn viewer_rail_returns_hub_rail_for_local_and_far_threads() {
     assert_eq!(r["ok"], true);
     assert_eq!(r["result"]["mode"], "viewer");
     let expected_local = serde_json::to_value(rail(RailInput {
-        board: src.board, schematic: src.schematic, mech: src.mech, gerbers: src.gerbers,
+        board: src.board, schematic: src.schematic, mech: src.mech, gerbers: src.gerbers(),
         simulation: false, altium: src.altium, page: "files", diff: false, no_project: false, present: &[],
     })).unwrap();
     assert_eq!(r["result"]["rail"], expected_local);
-    assert_eq!(r["result"]["has"], json!({"board": src.board, "schematic": src.schematic, "mech": src.mech, "gerbers": src.gerbers}));
+    assert_eq!(r["result"]["has"], json!({"board": src.board, "schematic": src.schematic, "mech": src.mech, "gerbers": src.gerbers()}));
     assert!(!r["result"]["rail"].as_array().unwrap().iter().any(|x| x["id"] == "simulation"));
     // Even when page=="gerbers" with no Gerber set, `has.gerbers` stays false so phones reconcile away from a removed source
     let rg = ask(&mut ws, 4, "viewer.rail", json!({"thread":"t1","page":"gerbers"})).await;
     assert_eq!(rg["ok"], true);
-    assert_eq!(rg["result"]["has"]["gerbers"], src.gerbers);
+    assert_eq!(rg["result"]["has"]["gerbers"], src.gerbers());
 
     // diff=true lights the diff entry regardless of page
     let rd = ask(&mut ws, 2, "viewer.rail", json!({"thread":"t1","page":"files","diff":true})).await;
     assert_eq!(rd["ok"], true);
     let expected_diff = serde_json::to_value(rail(RailInput {
-        board: src.board, schematic: src.schematic, mech: src.mech, gerbers: src.gerbers,
+        board: src.board, schematic: src.schematic, mech: src.mech, gerbers: src.gerbers(),
         simulation: false, altium: src.altium, page: "files", diff: true, no_project: false, present: &[],
     })).unwrap();
     assert_eq!(rd["result"]["rail"], expected_diff);
