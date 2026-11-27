@@ -110,7 +110,9 @@ pub(crate) fn md_blocks(text: &str) -> Vec<Value> {
     KEPT.lock().unwrap().put(key, text.len(), &b);
     b
 }
-/// The same, never kept: the reply being streamed is another text at every step.
+/// The same, never kept: the reply being streamed is another text at every step. That is left as it is because the streamed notices are paced by what
+/// the last picture cost (`wire::live_gap`: ten steps a second for a cheap one, two for a 60 ms one), so the whole-text render's share of the hub's
+/// time is bounded by that pacing rather than growing with the reply (`a_live_reply_is_rendered_in_whole_at_every_step` holds the numbers).
 fn md_fresh(text: &str) -> Vec<Value> { md::nodes_json(&md::render(text)) }
 
 /// The rendered blocks of the texts drawn lately, by the text's length and hash. Two generations: a text asked for again moves to the new one, and when
@@ -811,6 +813,22 @@ mod tests {
         v
     }
     fn fixture() -> Value { serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../test/slim/fixtures/thread-pair.json")).unwrap()).unwrap() }
+    /// The reply being streamed is drawn from its whole text at every step (`md_fresh`), where every finished message is drawn from the kept blocks
+    /// (`md_blocks`). This says what that costs as the text grows, which is how a long answer's last seconds feel. Printed, and kept loose.
+    #[test] fn a_live_reply_is_rendered_in_whole_at_every_step() {
+        let block = |i: usize| format!("**Step {i}.** The rail from U{} to the regulator is routed on the top layer, clear of the pads.\n\n```rust\nlet x = {i} * 2;\n```\n\n- one point about the net\n- another about the clearance\n\n", i % 9);
+        let mut text = String::new();
+        for (name, target) in [("2 KB", 2048usize), ("8 KB", 8192), ("20 KB", 20480), ("40 KB", 40960)] {
+            let mut i = 0;
+            while text.len() < target { text.push_str(&block(i)); i += 1 }
+            let n = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..n { std::hint::black_box(md_fresh(&text)); }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            eprintln!("live reply {name} ({} blocks): md_fresh {ms:.3} ms a picture", text.len());
+            assert!(ms < 200.0, "rendering a {name} live reply took {ms:.1} ms");
+        }
+    }
     #[test] fn the_entries_of_a_plain_page_are_the_helpers() {
         let p = fixture(); let th = p["params"]["page"]["thread"].as_str().unwrap();
         let es = ents(p["params"]["page"]["rows"].as_array().unwrap(), th).unwrap();
