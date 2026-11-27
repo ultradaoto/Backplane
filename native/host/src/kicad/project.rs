@@ -35,6 +35,39 @@ pub fn found(root: &Path) -> Vec<String> {
     v.sort_by_key(key); v.truncate(50); v
 }
 fn names(dir: &Path) -> Vec<String> { let mut v: Vec<String> = std::fs::read_dir(dir).map(|r| r.flatten().filter_map(|e| e.file_name().to_str().map(str::to_string)).collect()).unwrap_or_default(); v.sort(); v }
+/// Whether the folder holds a `.kicad_pro` anywhere `found` looks: the same folders walked, stopping at the first project (a yes or no question, where
+/// `found` lists every project for the agent's prompt and the viewer's rail cannot start until it has walked the whole tree).
+pub fn has_kicad_project(root: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else { return false };
+        for e in rd.flatten() {
+            let os = e.file_name();
+            let Some(name) = os.to_str() else { continue };
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 4 && !name.starts_with('.') && name != "node_modules" && !name.ends_with("-backups") && walk(&e.path(), depth + 1) { return true }
+            } else if name.ends_with(".kicad_pro") { return true }
+        }
+        false
+    }
+    walk(root, 1)
+}
+/// Whether the folder holds an Altium project anywhere `altium_found` looks, stopping at the first one (see `has_kicad_project`).
+pub fn has_altium_project(root: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        let Ok(rd) = std::fs::read_dir(dir) else { return false };
+        for e in rd.flatten() {
+            let os = e.file_name();
+            let Some(name) = os.to_str() else { continue };
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 4 && !name.starts_with('.') && name != "node_modules" && !name.starts_with("__") && !copies(&name.to_lowercase()) && walk(&e.path(), depth + 1) { return true }
+            } else if name.to_lowercase().ends_with(".prjpcb") { return true }
+        }
+        false
+    }
+    walk(root, 1)
+}
 fn dir_of(p: &str) -> &str { p.rsplit_once('/').map(|(d, _)| d).unwrap_or("") }
 fn last_of(p: &str) -> &str { p.rsplit('/').next().unwrap_or(p) }
 fn abs(root: &str, rel: &str) -> String {
