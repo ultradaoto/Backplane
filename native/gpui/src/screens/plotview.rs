@@ -984,4 +984,29 @@ mod tests {
         let plain = state_json(&serde_json::json!({"open": "board", "key": "0|/p|"}), None, 0);
         assert!(plain.get("gerbers").is_none() && plain.get("empty").is_none());
     }
+    /// What a real board costs the canvas: the chunks of a real frame (the hub's own CBOR for ecc83, decoded as the client decodes it) tessellated at
+    /// the fit view and zoomed in four times. Printed, and kept loose.
+    #[test] fn a_real_board_tessellates_in_a_few_milliseconds() {
+        for (name, bytes) in [("ecc83-pp", &include_bytes!("../../../../test/files/fixtures/plot/ecc83-board.frame.cbor")[..])] {
+            let mut store = super::super::plot::Store::default();
+            store.receive(bytes).expect("the hub's own frame");
+            let f = store.frame.as_ref().expect("a frame");
+            let chunks = f.chunks.clone();
+            let bbox = f.bbox;
+            let (w, h) = (1200., 900.);
+            let v = View::fit(bbox, w, h);
+            let o = point(px(0.), px(0.));
+            let order: Vec<(usize, f32)> = (0..chunks.len()).map(|i| (i, 1.0)).collect();
+            let t = std::time::Instant::now();
+            let paths = tessellate(&chunks, &order, &v, o, w, h, 0.0, None).0.len();
+            let fit = t.elapsed().as_secs_f64() * 1e3;
+            // zoomed in four times about the same place: the same pieces, culled to what shows
+            let vz = View { scale: v.scale * 4.0, ..v };
+            let t = std::time::Instant::now();
+            let pathsz = tessellate(&chunks, &order, &vz, o, w, h, 0.0, None).0.len();
+            let zoom = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!("board {name}: {} chunks - tessellate fit {fit:.2} ms ({paths} paths), zoomed {zoom:.2} ms ({pathsz} paths)", chunks.len());
+            assert!(fit < 2000.0, "{name}: {fit:.1} ms to tessellate a board");
+        }
+    }
 }

@@ -465,6 +465,25 @@ mod tests {
         }
         (b, cks)
     }
+    /// What a plot costs the client before it can draw: the hub's lines parsed into chunks, then each chunk decoded into capsules. Printed, and kept
+    /// loose. The three real projects in `test/files/fixtures/plot` are geometry made by the real generator, not by this file's encoder.
+    #[test] fn a_plot_decodes_in_a_few_milliseconds() {
+        for (name, text) in [
+            ("ecc83-pp", include_str!("../../../../test/files/fixtures/plot/ecc83-pp.kicad_pcb.plot")),
+            ("microwave", include_str!("../../../../test/files/fixtures/plot/microwave.kicad_pcb.plot")),
+            ("rectifier (sch)", include_str!("../../../../test/files/fixtures/plot/rectifier.kicad_sch.plot")),
+            ("ecc83-pp (sch)", include_str!("../../../../test/files/fixtures/plot/ecc83-pp.kicad_sch.plot"))] {
+            let t = std::time::Instant::now();
+            let (_, cs) = child_chunks(text);
+            let parse = t.elapsed().as_secs_f64() * 1e3;
+            let t = std::time::Instant::now();
+            let (mut caps, mut polys) = (0usize, 0usize);
+            for c in &cs { let ch = Chunk::decode(c); caps += ch.caps.len() / 5; polys += ch.polys.len() }
+            let decode = t.elapsed().as_secs_f64() * 1e3;
+            eprintln!("plot {name}: {} chunks, {caps} capsules, {polys} fills, {} KB of lines - parse {parse:.2} ms, decode {decode:.2} ms", cs.len(), text.len() / 1024);
+            assert!(decode < 500.0, "{name}: decoding {caps} capsules took {decode:.1} ms");
+        }
+    }
     #[test] fn real_plots_from_the_generator_decode_inside_their_box() {
         for (name, text) in [("ecc83-pp", include_str!("../../../../test/files/fixtures/plot/ecc83-pp.kicad_pcb.plot")), ("microwave", include_str!("../../../../test/files/fixtures/plot/microwave.kicad_pcb.plot"))] {
             let (b, cs) = child_chunks(text);
