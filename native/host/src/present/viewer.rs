@@ -3840,8 +3840,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
     /// What a picture costs to build, per page, as the presenter builds it for every state change (an agent's turn makes many). A picture with
-    /// nothing open, a board or a schematic page asks only whether the project has fabrication output; the walk that names the newest set is
-    /// a Gerbers page's. Printed, and kept loose: a busy machine is slow.
+    /// nothing open, a board or a schematic page asks only whether the project has fabrication output; the walk that names the newest set is kept, so
+    /// even a Gerbers page finds it once rather than once a picture. Printed, and kept loose: a busy machine is slow.
+    /// With the per-picture work of these branches together (this follows the rails, the project read, the folder listing, the hardware probe, the
+    /// lazy set lookups and the kept path): idle 0.74 ms, board 1.87, schematic 1.77, split 2.21, Gerbers 2.79 - against 3.03, 3.83, 3.78, 4.51 and
+    /// 5.14 measured on `d1da7c7df` with the same test.
     #[test] fn a_picture_costs_a_millisecond_and_a_gerbers_page_the_walk_of_its_set() {
         let (st, th, d) = files_world("pic-measure"); let root = d.to_string_lossy().into_owned();
         std::fs::write(d.join("rc.kicad_sch"), "(kicad_sch)").unwrap(); std::fs::write(d.join("rc.kicad_pro"), "{}").unwrap();
