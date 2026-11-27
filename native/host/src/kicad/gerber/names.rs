@@ -106,8 +106,9 @@ pub fn default_set(root: &Path) -> Option<PathBuf> {
 }
 
 /// Project-relative set and newest fabrication file modification time in that set.
-/// Test aid: how many times a project's newest set was walked on this thread. The presenter makes a picture on every state change and must not
-/// walk for a page that shows no Gerber set (`present::viewer`'s picture test pins it), nor twice for one that does.
+/// Test aid: how many times a project's newest set was walked on this thread. A picture is made on every state change, and a Gerbers page drawn with no
+/// file named asks for the newest set on each of them (`present::viewer` keeps the path it found; `a_gerbers_page_keeps_the_newest_set_it_found`
+/// pins that it does not walk again).
 #[cfg(test)] thread_local! { static WALKS: std::cell::Cell<usize> = std::cell::Cell::new(0); }
 #[cfg(test)] pub fn walks() -> usize { WALKS.with(|w| w.get()) }
 pub fn newest_set(root: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
