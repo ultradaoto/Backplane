@@ -3832,10 +3832,15 @@ mod tests {
         for page in ["", "board", "schematic", "split", "gerbers"] {
             let mut s = sess(&th, json!({}));
             if !page.is_empty() { let o = view_action(&st, "h", &s, page).unwrap(); crate::session::patch::merge(&mut s, &o.patch); }
-            let n = 30; let t = std::time::Instant::now();
+            let n = 30; let walks = crate::files::kicad::gerber::walks();
+            let t = std::time::Instant::now();
             for k in 0..n { let v = viewer_json(&st, &template, &s).expect("a picture"); assert!(v["open"].as_str().is_some()); drop(v); let _ = k; }
             let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
-            eprintln!("picture: {:9} {ms:.3} ms", if page.is_empty() { "idle" } else { page });
+            let walked = crate::files::kicad::gerber::walks() - walks;
+            eprintln!("picture: {:9} {ms:.3} ms, {:.2} newest-set walks a picture", if page.is_empty() { "idle" } else { page }, walked as f64 / n as f64);
+            // a picture that shows no Gerber set must not walk the project for one; a Gerbers page walks it once (the set it names)
+            if page == "gerbers" { assert!(walked > 0 && walked <= n, "a Gerbers picture finds its set ({walked} walks over {n} pictures)") }
+            else { assert_eq!(walked, 0, "{page}: a picture with no Gerber set must not walk the project ({walked} walks over {n})") }
             assert!(ms < 40.0, "a picture should not cost 40 ms ({page}: {ms:.3})");
         }
     }
