@@ -94,7 +94,12 @@ pub fn default_set(root: &Path) -> Option<PathBuf> {
 }
 
 /// Project-relative set and newest fabrication file modification time in that set.
+/// Test aid: how many times a project's newest set was walked on this thread. The presenter makes a picture on every state change and must not
+/// walk for a page that shows no Gerber set (`present::viewer`'s picture test pins it), nor twice for one that does.
+#[cfg(test)] thread_local! { static WALKS: std::cell::Cell<usize> = std::cell::Cell::new(0); }
+#[cfg(test)] pub fn walks() -> usize { WALKS.with(|w| w.get()) }
 pub fn newest_set(root: &Path) -> Option<(PathBuf, std::time::SystemTime)> {
+    #[cfg(test)] WALKS.with(|w| w.set(w.get() + 1));
     let canon_root = crate::plat::fs::canonicalize(root).ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     fn walk(d: &Path, depth: u32, canon_root: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
