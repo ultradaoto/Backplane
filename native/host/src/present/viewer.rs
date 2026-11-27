@@ -3620,6 +3620,33 @@ mod tests {
     }
 
 
+    /// The sidebar asks every project, and the viewer's every picture asks for its own: "is there hardware here" is a yes or no, and it used to list
+    /// the whole tree twice to answer it. Printed, and kept loose.
+    #[test] fn hardware_is_a_yes_or_no_not_a_listing_of_the_tree() {
+        let d = crate::plat::tmp::canonical("hw-measure");
+        std::fs::write(d.join("rc.kicad_pro"), "{}").unwrap(); std::fs::write(d.join("rc.kicad_pcb"), "(kicad_pcb)").unwrap();
+        for sub in 0..20 { let p = d.join(format!("libs/sub{sub}")); std::fs::create_dir_all(&p).unwrap(); for k in 0..200 { std::fs::write(p.join(format!("part{k}.step")), "x").unwrap() } }
+        let root = d.to_string_lossy().into_owned();
+        let n = 10;
+        let t = std::time::Instant::now();
+        for _ in 0..n { assert!(crate::files::kicad::canonical::hardware(&root)) }
+        let hw = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n { assert!(!crate::files::kicad::project::found(std::path::Path::new(&root)).is_empty()) }
+        let found = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n { assert!(crate::files::kicad::project::has_kicad_project(std::path::Path::new(&root))) }
+        let probe = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        eprintln!("hardware of a project with 4000 files in libs/: hardware {hw:.2} ms, found (the list) {found:.2} ms, the probe {probe:.2} ms");
+        // a folder with no project at all: the answer is no, and both still walk it (nothing to stop at)
+        let code = crate::plat::tmp::canonical("hw-measure-code");
+        for sub in 0..20 { let p = code.join(format!("src/sub{sub}")); std::fs::create_dir_all(&p).unwrap(); for k in 0..200 { std::fs::write(p.join(format!("m{k}.rs")), "x").unwrap() } }
+        let c = code.to_string_lossy().into_owned();
+        let t = std::time::Instant::now();
+        for _ in 0..n { assert!(!crate::files::kicad::canonical::hardware(&c)) }
+        eprintln!("  a folder with no project (the same 4000 files): hardware {:.2} ms", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+        assert!(hw < found, "the yes stops at the first project ({hw:.2} vs {found:.2} ms)");
+    }
     fn files_world(tag: &str) -> (State, String, crate::plat::tmp::TempDir) {
         let d = crate::plat::tmp::canonical(&format!("fm-pres-{tag}")); std::fs::create_dir_all(d.join("docs/deep")).unwrap(); std::fs::create_dir_all(d.join("mech")).unwrap();
         for (f, c) in [("notes.md", "# n"), ("a.kicad_pcb", "(kicad_pcb)"), ("pic.png", "x"), ("doc.pdf", "x"), ("m.step", "x"), ("plain.bin", "x"), ("docs/a.txt", "a"), (".env", "k"), ("docs/server.key", "k")] { std::fs::write(d.join(f), c).unwrap(); }

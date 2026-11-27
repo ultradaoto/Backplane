@@ -102,9 +102,17 @@ pub fn is_document(p: &str) -> bool { p.ends_with(".kicad_pcb") || p.ends_with("
 
 /// Hardware: a project with KiCad files (a `.kicad_pro` up to four folders down, or a board or
 /// schematic in its root). Such a project's threads work in the main checkout.
+/// The root is asked first, in one folder read: a project's own folder almost always holds its `.kicad_pro` (or its board) beside the folders the
+/// tree walk would descend into, and that walk is what the picture paid for — this is asked on every page a viewer builds, ten seconds at a time,
+/// and for every project in the sidebar. The walks that follow stop at the first project they meet (`project::has_kicad_project`,
+/// `has_altium_project`), where `found` and `altium_found` list every one of them for the agent's prompt.
 pub fn hardware(root: &str) -> bool {
-    !project::found(std::path::Path::new(root)).is_empty() || !project::altium_found(std::path::Path::new(root)).is_empty()
-        || std::fs::read_dir(root).map(|d| d.flatten().any(|e| { let n = e.file_name().to_string_lossy().into_owned(); n.ends_with(".kicad_pcb") || n.ends_with(".kicad_sch") || is_document(&n) })).unwrap_or(false)
+    let dir = std::path::Path::new(root);
+    let here = std::fs::read_dir(root).map(|d| d.flatten().any(|e| {
+        let n = e.file_name().to_string_lossy().into_owned();
+        n.ends_with(".kicad_pro") || n.to_lowercase().ends_with(".prjpcb") || n.ends_with(".kicad_pcb") || n.ends_with(".kicad_sch") || is_document(&n)
+    })).unwrap_or(false);
+    here || project::has_kicad_project(dir) || project::has_altium_project(dir)
 }
 static HW: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>> = std::sync::OnceLock::new();
 /// `hardware`, remembered for ten seconds (the viewer asks on every page it builds).
