@@ -9,7 +9,15 @@ mod shelf;
 mod signal;
 use std::io::{BufRead, BufReader};
 use std::time::Instant;
-fn rss_kib() -> u64 { std::fs::read_to_string("/proc/self/status").ok().and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok())).unwrap_or(0) }
+#[path = "../kicad/mem.rs"]
+mod mem;
+/// The hub's platform layer, for the one call `mem` makes into it (the machine's total memory, which this bench does not print).
+#[path = "../plat/mod.rs"]
+#[allow(dead_code)]
+mod plat;
+/// This process's resident memory, in KiB: the bench's own reading, through the hub's cross-platform one (Linux /proc, macOS Mach, Windows
+/// working set), so a run on a Windows or macOS machine reports what the log added as well as a Linux one does.
+fn rss_kib() -> u64 { mem::proc_mb(std::process::id()).map_or(0, |(now, _)| now * 1024) }
 fn main() {
     let path = std::env::args().nth(1).expect("log");
     let lean = std::env::args().nth(2).map_or(true, |a| a != "full");
