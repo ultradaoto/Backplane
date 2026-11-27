@@ -666,8 +666,8 @@ async fn viewers(hub: &Arc<Hub>, c: &mut Conn, m: &str, p: &Value, is_browser: b
                     let root = crate::files::kicad::canonical::design_root(&root_of(hub, th).await?);
                     let src = crate::present::viewer::rail_sources(&root);
                     (
-                        rail(RailInput { board: src.board, schematic: src.schematic, mech: src.mech, gerbers: src.gerbers, simulation: false, altium: src.altium, page, diff, no_project: false, present: &[] }),
-                        json!({"board": src.board, "schematic": src.schematic, "mech": src.mech, "gerbers": src.gerbers}),
+                        rail(RailInput { board: src.board, schematic: src.schematic, mech: src.mech, gerbers: src.gerbers(), simulation: false, altium: src.altium, page, diff, no_project: false, present: &[] }),
+                        json!({"board": src.board, "schematic": src.schematic, "mech": src.mech, "gerbers": src.gerbers()}),
                     )
                 };
                 // Goes away when viewer.layout exists on data/1: browser clients omit Split while phones keep it.
