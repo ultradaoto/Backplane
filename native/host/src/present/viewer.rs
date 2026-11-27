@@ -809,8 +809,9 @@ fn page(template: &Value, kind: &str, root: &str, drafts: &Value, sel: &str, sou
         if let Some(p) = set {
             shown.path = p.to_string_lossy().into_owned();
             if !sel.contains('~') && !root.is_empty() {
-                let time = sources.newest.as_ref().filter(|(path, _)| path == &p).map(|(_, t)| *t);
-                (files, shown.made_at) = crate::files::kicad::gerber::shown_set(std::path::Path::new(root), &p, time);
+                // (no time passed in: `shown_set` reads the set's own newest fabrication file, which is exactly what the project-wide newest was
+                // filtered to here — and finding that one walks the whole folder, on every picture of a Gerbers page)
+                (files, shown.made_at) = crate::files::kicad::gerber::shown_set(std::path::Path::new(root), &p, None);
             }
         }
         shown.has = (!sel.contains('~') && !root.is_empty()).then_some(!files.is_empty());
