@@ -787,7 +787,7 @@ fn page(template: &Value, kind: &str, root: &str, drafts: &Value, sel: &str, sou
         o.insert("gerbersVsBoard".into(), json!(no_board || raw_file.starts_with(crate::files::kicad::gerber::CMP)));
         // what "Open in GerbView" opens (the set's job, else its files): the desktop offers it where its KiCad has GerbView in process
         let set = crate::files::kicad::gerber::set_of(raw_file);
-        let set = if set.is_empty() { sources.newest().map(|(p, _)| p.clone()) }
+        let set = if set.is_empty() { let p = newest_set_path(root); if p.is_empty() { None } else { Some(std::path::PathBuf::from(p)) } }
             else { viewer_identity::relative(root, set).map(|rel| std::path::Path::new(root).join(rel)) };
         if no_board {
             k.clear();
@@ -809,8 +809,9 @@ fn page(template: &Value, kind: &str, root: &str, drafts: &Value, sel: &str, sou
         if let Some(p) = set {
             shown.path = p.to_string_lossy().into_owned();
             if !sel.contains('~') && !root.is_empty() {
-                let time = sources.newest().filter(|(path, _)| path == &p).map(|(_, t)| *t);
-                (files, shown.made_at) = crate::files::kicad::gerber::shown_set(std::path::Path::new(root), &p, time);
+                // (no time passed in: `shown_set` reads the set's own newest fabrication file, which is exactly what the project-wide newest was
+                // filtered to here — and finding that one walks the whole folder, on every picture of a Gerbers page)
+                (files, shown.made_at) = crate::files::kicad::gerber::shown_set(std::path::Path::new(root), &p, None);
             }
         }
         shown.has = (!sel.contains('~') && !root.is_empty()).then_some(!files.is_empty());
@@ -1169,10 +1170,11 @@ pub fn viewer_json(st: &State, template: &Value, session: &Value) -> Option<Valu
     let mut had_stored_layout = false;
     if !sel.is_empty() {
         let linked = sel.contains('~');
-        // (the Gerber set is read only for a page that draws one: finding it is a walk of the project, the dear part of these rails)
-        let gerber_set = if v["gerbers"] == true { sources.gerber_set() } else { "" };
+        // (the Gerber set is read only for a page that draws one, and through the one thing that keeps it: a Gerbers page drawing the same set picture
+        // after picture was a walk of the project's folders each time)
+        let gerber_set = if v["gerbers"] == true { newest_set_path(&root) } else { String::new() };
         let (eff_root_local, default_pcb, default_sch, default_gerber_set) = if local {
-            (root.as_str(), sources.pcb.as_str(), sources.sch.as_str(), gerber_set)
+            (root.as_str(), sources.pcb.as_str(), sources.sch.as_str(), gerber_set.as_str())
         } else { ("", "", "", "") };
         let linked_root = if linked {
             st.threads.get(sel).map(|t| {
@@ -1686,9 +1688,39 @@ pub fn refresh_gerber_sets_for(owner: u64, root: &str, layout: &super::layout::L
 }
 /// `refresh_gerber_sets_for` for an owner that is not a session (tests).
 pub fn refresh_gerber_sets(root: &str, layout: &super::layout::Layout) { refresh_gerber_sets_for(0, root, layout) }
+/// The folders a project's newest Gerber set is looked for in, with the times they had when it was found: the root (a `mfg` folder appearing moves it)
+/// and the three folders it searches.
+type NewestStamp = Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>;
+/// What `newest_set_path` kept: the project, those times, and the set it found.
+static NEWEST_SETS: std::sync::LazyLock<std::sync::Mutex<Vec<(String, NewestStamp, String)>>> = std::sync::LazyLock::new(Default::default);
+
+/// The project's newest Gerber set (its path under the root, "" when it has none), kept while the folders it is found in have not moved.
+/// A Gerbers page drawn with no file named asks for it on every picture, and finding it walks `mfg`/`gerbers`/`gerber` three deep. What the page draws
+/// from it is the set's *path*, which changes when a set appears, vanishes or is renamed — each of which moves a folder's own time, so those are the
+/// times kept. A set whose files are rewritten keeps its path and its folder's time (a rewrite in place moves neither), so nothing is missed there.
+/// A watch start refreshes it too (`refresh_gerber_sets_for_root`), as the membership cache beside it is refreshed.
+fn newest_set_path(root: &str) -> String {
+    if root.is_empty() { return String::new() }
+    let now: NewestStamp = ["", "mfg", "gerbers", "gerber"].iter().map(|d| {
+        let p = if d.is_empty() { std::path::PathBuf::from(root) } else { std::path::Path::new(root).join(d) };
+        let t = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+        (p, t)
+    }).collect();
+    { let k = NEWEST_SETS.lock().unwrap_or_else(|e| e.into_inner()); if let Some((_, was, found)) = k.iter().find(|(r, _, _)| r == root) { if *was == now { return found.clone() } } }
+    let found = crate::files::kicad::gerber::default_set(std::path::Path::new(root)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut k = NEWEST_SETS.lock().unwrap_or_else(|e| e.into_inner());
+    k.retain(|(r, _, _)| r != root);
+    if k.len() >= 16 { k.remove(0); }
+    k.push((root.to_string(), now, found.clone()));
+    found
+}
+/// Forget what `newest_set_path` kept for a project: the next picture finds the newest set again (a watch start does this, as it re-checks the sets).
+fn forget_newest_set_path(root: &str) { NEWEST_SETS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(r, _, _)| r != root) }
+
 /// Re-check all tracked Gerber sets under `root` when a watch updates.
 pub fn refresh_gerber_sets_for_root(root: &str) {
     if root.is_empty() { return; }
+    forget_newest_set_path(root);
     let keys: Vec<String> = {
         let c = gerber_set_state().lock().unwrap_or_else(|e| e.into_inner());
         c.map.keys().filter(|(r, _)| r == root).map(|(_, rel)| rel.clone()).collect()
@@ -2532,7 +2564,7 @@ fn build_tiles_picture(
     // A Gerber set's own path is walked for only when this picture has a tile that draws one: it names the watch key and the vanished check.
     let gerbers_tile = layout.tiles().iter().any(|t| t.kind == PageKind::Gerbers
         || (t.kind == PageKind::Board && t.overlay.as_ref().is_some_and(|o| o.kind == PageKind::Gerbers)));
-    let default_gerber_rel = if gerbers_tile { sources.map(|s| layout::sanitize_rel(root, s.gerber_set())).unwrap_or_default() } else { String::new() };
+    let default_gerber_rel = if gerbers_tile && sources.is_some() { layout::sanitize_rel(root, &newest_set_path(root)) } else { String::new() };
     let watch_ctx = layout::WatchContext {
         root: root.to_string(),
         default_pcb: default_pcb.to_string(),
@@ -2862,6 +2894,9 @@ fn layout_action_inner(
         } else {
             sources.root_sheet.clone()
         };
+        // (the set is read through the one thing that keeps it: a Gerbers page drawing the same set picture after picture was a walk of the folders each
+        // time)
+        let default_set = if s(drafts, &format!("@view.gerbers:{sel}")) == "1" { newest_set_path(&root) } else { String::new() };
         layout::derive_layout(&layout::DeriveInput {
             root: &root,
             open: legacy_open(session, sel),
@@ -2879,8 +2914,7 @@ fn layout_action_inner(
             files_dir: s(drafts, &format!("@files.dir:{sel}")),
             default_pcb: &sources.pcb,
             default_sch: &sources.sch,
-            // (the set is read only where the layout draws one: its walk is the dear part of these rails)
-            default_gerber_set: if s(drafts, &format!("@view.gerbers:{sel}")) == "1" { sources.gerber_set() } else { "" },
+            default_gerber_set: default_set.as_str(),
         })
     });
 
@@ -2931,7 +2965,7 @@ fn layout_action_inner(
                 match kind {
                     PageKind::Board | PageKind::Solid3d => layout::sanitize_rel(&root, &sources.pcb),
                     PageKind::Schematic | PageKind::Simulation => layout::sanitize_rel(&root, &sources.sch),
-                    PageKind::Gerbers => layout::sanitize_rel(&root, sources.gerber_set()),
+                    PageKind::Gerbers => layout::sanitize_rel(&root, &newest_set_path(&root)),
                     _ => String::new(),
                 }
             };
@@ -3807,6 +3841,33 @@ mod tests {
             else { assert_eq!(walked, 0, "{page}: a picture with no Gerber set must not walk the project ({walked} walks over {n})") }
             assert!(ms < 40.0, "a picture should not cost 40 ms ({page}: {ms:.3})");
         }
+    }
+    /// A Gerbers page drawn with no file named asks for the project's newest set: it is a walk of `mfg`/`gerbers`/`gerber` three deep, and a picture is
+    /// made on every state change. What it found is kept while the folders it looked in have not moved, and a watch start asks again.
+    #[test] fn a_gerbers_page_keeps_the_newest_set_it_found() {
+        let (st, th, d) = files_world("gerb-kept"); let root = d.to_string_lossy().into_owned();
+        for set in ["mfg/a", "mfg/b"] { std::fs::create_dir_all(d.join(set)).unwrap(); for k in 0..3 { std::fs::write(d.join(set).join(format!("l{k}.gbr")), "G04*").unwrap(); std::thread::sleep(std::time::Duration::from_millis(10)); } }
+        let template: Value = serde_json::from_str::<Value>(include_str!("thread_static.json")).unwrap()["viewer"].clone();
+        let mut s = sess(&th, json!({}));
+        let o = view_action(&st, "h", &s, "gerbers").unwrap(); crate::session::patch::merge(&mut s, &o.patch);
+        let page = |s: &Value| viewer_json(&st, &template, s).expect("a picture");
+        let first = page(&s)["key"].as_str().unwrap_or("").to_string();
+        let named = |k: &str| std::path::Path::new(k).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        assert_eq!(named(&first), "b", "the set written last: {first}");
+        let walked = crate::files::kicad::gerber::walks();
+        for _ in 0..5 { assert_eq!(page(&s)["key"], json!(first), "the same set, drawn again") }
+        assert_eq!(crate::files::kicad::gerber::walks(), walked, "the pictures after it do not walk the project");
+        // a watch start asks again whatever moved, as it does for the sets it re-checks
+        refresh_gerber_sets_for_root(&root);
+        let again = crate::files::kicad::gerber::walks();
+        assert_eq!(page(&s)["key"], json!(first), "the same answer, found again");
+        assert_eq!(crate::files::kicad::gerber::walks(), again + 1, "exactly one walk for the watch start");
+        // and a folder that moved is looked at without waiting for one: a set renamed moves mfg's own time
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::rename(d.join("mfg/b"), d.join("mfg/bb")).unwrap();
+        let _ = page(&s)["key"].as_str().unwrap_or("").to_string();
+        assert!(crate::files::kicad::gerber::walks() > again + 1, "the moved folder was looked at again");
+        let _ = std::fs::remove_dir_all(&d);
     }
     fn sess(th: &str, drafts: Value) -> Value { json!({"sel": th, "rid": 1, "drafts": drafts, "open": {}, "adding": false, "panel": false, "info": {}}) }
     #[test] fn the_files_page_lists_rows_trail_and_downloads_as_core_fm_does() {
