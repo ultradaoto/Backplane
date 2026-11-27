@@ -1996,7 +1996,7 @@ impl WatchContext {
         if root.is_empty() {
             return Self::default();
         }
-        let files = project::read(root);
+        let files = project::read_names(root);
         Self {
             root: root.to_string(),
             default_pcb: files.pcb,

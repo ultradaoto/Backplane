@@ -1054,7 +1054,7 @@ fn working_file(file: &str) -> &str {
 fn rail_sources_for(root: &str, selected: &str, kind: &str, file: &str, sheet: &str) -> RailSources {
     use std::path::Path;
     if root.is_empty() { return RailSources::default(); }
-    let files = crate::files::kicad::project::read(root);
+    let files = crate::files::kicad::project::read_names(root);
     let file = working_file(file);
     let board_path = if matches!(kind,"board"|"3d") && !file.is_empty() { file } else if selected.is_empty() { &files.pcb } else { selected };
     let root_sheet = if selected.is_empty() || files.sch.to_ascii_lowercase().ends_with(".schdoc") {
@@ -1964,7 +1964,7 @@ fn memory_layout(st: &State, root: &str) -> Option<super::layout::Layout> {
 fn tile_resolvable(root: &str, t: &super::layout::Tile, resolver: &super::layout::VersionSourceMap, budget: &crate::files::rv::ProbeBudget) -> bool {
     use super::layout::{PageKind, VersionResolver};
     let root_p = std::path::Path::new(root);
-    let own = crate::files::kicad::project::read(root);
+    let own = crate::files::kicad::project::read_names(root);
     // the project's own file for a page (relative to the root; "" when it has none)
     let default_rel = |kind: PageKind| -> String {
         let abs = match kind { PageKind::Board | PageKind::Solid3d => own.pcb.clone(), PageKind::Schematic | PageKind::Simulation => own.sch.clone(),
@@ -2034,7 +2034,7 @@ fn hierarchy_of(top: &str, root: &str) -> std::collections::BTreeSet<String> {
 fn owning_top(root: &str, rel: &str) -> String {
     if rel.is_empty() || root.is_empty() { return String::new() }
     let abs = lexical(&format!("{}/{rel}", root.trim_end_matches(['/', '\\'])));
-    let own = lexical(&crate::files::kicad::project::read(root).sch);
+    let own = lexical(&crate::files::kicad::project::read_names(root).sch);
     if abs == own || (!own.is_empty() && hierarchy_of(&own, root).contains(&abs)) { return String::new() }
     let beside = |f: &str| f.strip_suffix(".kicad_sch").is_some_and(|stem| std::path::Path::new(&format!("{stem}.kicad_pcb")).is_file());
     if beside(&abs) { return abs }
@@ -2058,7 +2058,7 @@ fn owning_top(root: &str, rel: &str) -> String {
 /// its opaque tile id; a source several tiles draw is listed for each of them (the hub subscribes it once and answers each tile with the keys it draws from).
 /// `force` marks the focused tile's sources: a Retry re-reads those only. A default source's path is "" and a named one's the file, as one `kicad.watch` carries it.
 pub(crate) fn watch_sources(l: &super::layout::Layout, root: &str, linked: bool, force: bool) -> Vec<Value> {
-    let (pcb, sch) = if linked { (String::new(), String::new()) } else { let f = crate::files::kicad::project::read(root); (f.pcb, f.sch) };
+    let (pcb, sch) = if linked { (String::new(), String::new()) } else { let f = crate::files::kicad::project::read_names(root); (f.pcb, f.sch) };
     let ctx = super::layout::WatchContext { root: root.to_string(), default_pcb: pcb, default_sch: sch };
     let resolver = project_version_resolver(root);
     let mut out = vec![];
@@ -2696,7 +2696,7 @@ fn check_versions(l: &super::layout::Layout, root: &str, linked: bool) -> Result
     if linked || root.is_empty() { return Ok(()) }
     let resolver = project_version_resolver(root);
     let budget = probe_budget();
-    let own = crate::files::kicad::project::read(root);
+    let own = crate::files::kicad::project::read_names(root);
     let rel_for = |kind: PageKind, src: &str| -> String {
         if !src.is_empty() { return src.to_string() }
         let abs = match kind { PageKind::Board | PageKind::Solid3d => own.pcb.clone(), PageKind::Schematic | PageKind::Simulation => own.sch.clone(), _ => String::new() };
@@ -3065,7 +3065,7 @@ pub fn split_sources(session: &Value, root: &str, linked: bool, path: &str) -> (
     let pick = if named.is_empty() { chosen_board(&session["drafts"], sel, root) } else { named };
     if !pick.is_empty() { let sch = schematic_for_board(&pick); return (pick, sch) }
     if linked || root.is_empty() { return (String::new(), String::new()) }
-    let f = crate::files::kicad::project::read(root);
+    let f = crate::files::kicad::project::read_names(root);
     (super::layout::sanitize_rel(root, &f.pcb), super::layout::sanitize_rel(root, &f.sch))
 }
 
@@ -3200,7 +3200,7 @@ pub fn viewer_show_action(
             // on a thread of another machine the sheet goes to that machine (`on`)
             if nk == "schematic" && sch_path {
                 let shown = vo.patch["drafts"][format!("@view.file:{sel}")].as_str().unwrap_or("").to_string();
-                let shown = if shown.is_empty() { if linked { String::new() } else { crate::files::kicad::project::read(&root).sch } } else { shown };
+                let shown = if shown.is_empty() { if linked { String::new() } else { crate::files::kicad::project::read_names(&root).sch } } else { shown };
                 if abs != shown && !owned {
                     let mut after = base.clone(); patch::merge(&mut after, &vo.patch);
                     match sheet_action_for(st, hub, &after, client_id, locale, &abs) {
@@ -3272,7 +3272,7 @@ fn frame_switch_preserves_design_mode_and_unknown_documents_stay_distinct() {
 }
 
 pub(crate) fn has_management(root: &str) -> bool {
-    let files = crate::files::kicad::project::read(root);
+    let files = crate::files::kicad::project::read_names(root);
     !root.is_empty() && !crate::files::kicad::project::is_altium(&files)
         && [files.pcb, files.sch].iter().any(|p| std::path::Path::new(p).is_file())
 }
@@ -3648,6 +3648,26 @@ mod tests {
         let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
         eprintln!("rail_sources: {ms:.2} ms an ask (a board, a sheet, 5 mech parts, 24 Gerbers in 2 sets)");
         assert!(ms < 20.0, "rails for every picture should not cost a picture ({ms:.2} ms)");
+    }
+
+    /// A project's folder holds whatever it holds: a picture must not search it for every project file it could contain. Printed, and kept loose.
+    #[test] fn a_picture_does_not_search_the_projects_tree_for_its_own_files() {
+        let d = crate::plat::tmp::canonical("proj-read-measure");
+        std::fs::write(d.join("rc.kicad_pro"), "{}").unwrap(); std::fs::write(d.join("rc.kicad_pcb"), "(kicad_pcb)").unwrap(); std::fs::write(d.join("rc.kicad_sch"), "(kicad_sch)").unwrap();
+        for sub in 0..20 { let p = d.join(format!("libs/sub{sub}")); std::fs::create_dir_all(&p).unwrap(); for k in 0..100 { std::fs::write(p.join(format!("part{k}.step")), "x").unwrap() } }
+        let root = d.to_string_lossy().into_owned();
+        let n = 10;
+        let ms = |f: &dyn Fn()| { let t = std::time::Instant::now(); for _ in 0..n { f() } t.elapsed().as_secs_f64() * 1000.0 / n as f64 };
+        let every = ms(&|| { assert!(!crate::files::kicad::project::read(&root).pcb.is_empty()) });
+        let names = ms(&|| { assert!(!crate::files::kicad::project::read_names(&root).pcb.is_empty()) });
+        let rails = ms(&|| { assert!(rail_sources(&root).board) });
+        eprintln!("big project (2000 files in libs/): project::read {every:.2} ms, read_names {names:.2} ms, rail_sources {rails:.2} ms");
+        // the picture's read names the same files as the full one
+        let (a, b) = (crate::files::kicad::project::read(&root), crate::files::kicad::project::read_names(&root));
+        assert_eq!((a.pro, a.pcb, a.sch), (b.pro, b.pcb, b.sch), "the same project either way");
+        assert!(b.all.is_empty() && !a.all.is_empty(), "only the agent's read lists the other projects");
+        assert!(names < every, "the picture's read must not search the tree ({names:.2} vs {every:.2} ms)");
+        assert!(rails < every, "nor may the rails ({rails:.2} vs {every:.2} ms)");
     }
     fn files_world(tag: &str) -> (State, String, crate::plat::tmp::TempDir) {
         let d = crate::plat::tmp::canonical(&format!("fm-pres-{tag}")); std::fs::create_dir_all(d.join("docs/deep")).unwrap(); std::fs::create_dir_all(d.join("mech")).unwrap();
@@ -4183,7 +4203,7 @@ mod tests {
         std::fs::write(d.join("p.kicad_pro"), "{}").unwrap();
         let sch = d.join("p.kicad_sch"); std::fs::write(&sch, "(kicad_sch)").unwrap();
         assert_eq!(split_pane_empty("schematic", &root, "", &sch.to_string_lossy(), false), None);
-        if !crate::files::kicad::project::read(&root).sch.is_empty() {
+        if !crate::files::kicad::project::read_names(&root).sch.is_empty() {
             assert_eq!(split_pane_empty("schematic", &root, "", "", false), None);
             assert!(split_pane_empty("board", &root, "", "", false).is_some());
             assert!(split_pane_empty("3d", &root, "", "", false).is_some());

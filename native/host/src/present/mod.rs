@@ -326,7 +326,7 @@ mod tests {
             let r = wp["root"].as_str().unwrap();
             let path = wp["path"].as_str().unwrap_or("");
             let board = wp["board"].as_str().unwrap_or("");
-            let f = crate::files::kicad::project::read(r);
+            let f = crate::files::kicad::project::read_names(r);
             let picked = !board.is_empty();
             let own_sch = if picked {
                 board.strip_suffix(".kicad_pcb").map(|b| format!("{b}.kicad_sch")).filter(|p| std::path::Path::new(p).is_file()).unwrap_or_default()
@@ -912,7 +912,7 @@ mod tests {
         st.apply_line(&json!({"$":"ThreadCreated","id":"tp","project":"p","title":"T","env":"local","branch":"","worktree":"","provider":"claude","model":"","at":2}).to_string());
         let idle = json!({"sel":"tp","rid":1,"drafts":{},"panel":false,"info":{"fab.board:tp":"unit.kicad_pcb","fab.boards:tp":"unit.kicad_pcb\nalt/alt.kicad_pcb"}});
         // the project's own files as the hub finds them (the agent's read-back resolves a key with no path the same way)
-        let own = crate::files::kicad::project::read(&root);
+        let own = crate::files::kicad::project::read_names(&root);
         let dflt = viewer::ShowDefaults { root: root.clone(), pcb: own.pcb, sch: own.sch, set: crate::files::kicad::gerber::default_set(std::path::Path::new(&root)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default() };
         // what the desktop reports of a picture (gpui `plotview::state_json`)
         let report = |v: &Value| {
@@ -1021,7 +1021,7 @@ mod tests {
         let mut s = picked.clone(); crate::session::patch::merge(&mut s, &vo.patch);
         assert_eq!(s["drafts"]["@view.board:ts"], "", "the own board is no pick");
         let pic = viewer::viewer_json(&st, &json!({}), &s).unwrap();
-        let own_files = crate::files::kicad::project::read(&root);
+        let own_files = crate::files::kicad::project::read_names(&root);
         let dflt = viewer::ShowDefaults { root: root.clone(), pcb: own_files.pcb, sch: own_files.sch, set: String::new() };
         let report = json!({"open": pic["open"], "key": pic["key"]});
         assert!(viewer::show_settled(&viewer::show_want("schematic", &own_sch, &root, &dflt), &report, &dflt), "the own schematic is on show, not the alternate board's: {}", pic["key"]);
@@ -1116,7 +1116,7 @@ mod tests {
         assert!(!settled(json!(["board\tunit.kicad_pcb", "schematic\talt/alt.kicad_sch"])), "the Schematic must be the board's sibling, not any schematic");
         // an unnamed Split means the session's current pick (else the project's own): the mutation and the read-back share it
         assert_eq!(viewer::split_sources(&picked, &root, false, ""), ("alt/alt.kicad_pcb".to_string(), "alt/alt.kicad_sch".to_string()));
-        let own = crate::files::kicad::project::read(&root);
+        let own = crate::files::kicad::project::read_names(&root);
         assert_eq!(viewer::split_sources(&json!({"sel":"tr","drafts":{}}), &root, false, ""), (layout::sanitize_rel(&root, &own.pcb), layout::sanitize_rel(&root, &own.sch)), "the project's own pair, as the hub finds it");
     }
     /// 2b: a layout of several tiles watches its distinct sources through one `kicad.watch.set`; a single tile keeps main's one `kicad.watch`; a focus move sends
@@ -1258,7 +1258,7 @@ mod tests {
         st.apply_line(&json!({"$":"ThreadCreated","id":"tl2","project":"p","title":"T","env":"local","branch":"","worktree":"","provider":"claude","model":"","at":2}).to_string());
         let tile = |id: &str, src: &str, explicit| layout::Tile { id: id.into(), kind: layout::PageKind::Solid3d, source: src.into(), explicit, version: None, unresolved_version: false, overlay: None };
         // 1. default sources: no path on the wire, as one `kicad.watch` carries none
-        let own = layout::sanitize_rel(&root, &crate::files::kicad::project::read(&root).pcb);
+        let own = layout::sanitize_rel(&root, &crate::files::kicad::project::read_names(&root).pcb);
         let two = layout::add(&layout::Layout::single(layout::Tile { kind: layout::PageKind::Board, ..tile("t1", &own, false) }).unwrap(), Some("t1"), layout::Side::Right, tile("t2", &own, false), false, None).unwrap();
         let s = json!({"sel":"tl2","rid":1,"drafts":{"@view:tl2":"board","@view.layout:tl2":serde_json::to_string(&two).unwrap()},"panel":false,"info":{}});
         let viewer::LayoutOut::Ok(vo) = viewer::layout_action(&st, "h", &s, Some(1), "en", "layout-focus", r#"{"tile":"t1"}"#).unwrap() else { panic!() };
@@ -1511,7 +1511,7 @@ mod tests {
         let sheet = |child: &str| format!("(kicad_sch (sheet (at 0 0) (property \"Sheetname\" \"c\") (property \"Sheetfile\" \"{child}\")))");
         std::fs::write(d.join("a_top.kicad_sch"), sheet("z_child.kicad_sch")).unwrap(); std::fs::write(d.join("a_top.kicad_pcb"), "()").unwrap(); std::fs::write(d.join("z_child.kicad_sch"), "(kicad_sch)").unwrap();
         std::fs::write(d.join("alt/alt.kicad_sch"), sheet("b.kicad_sch")).unwrap(); std::fs::write(d.join("alt/alt.kicad_pcb"), "()").unwrap(); std::fs::write(d.join("alt/b.kicad_sch"), "(kicad_sch)").unwrap();
-        let own = crate::files::kicad::project::read(&root);
+        let own = crate::files::kicad::project::read_names(&root);
         assert!(own.sch.ends_with("a_top.kicad_sch"), "the project's own schematic is the first top-level: {}", own.sch);
         let mut st = crate::state::State::new();
         st.apply_line(&json!({"$":"ProjectCreated","id":"p","title":"Board","root":root,"at":1}).to_string());

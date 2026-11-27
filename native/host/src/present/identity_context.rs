@@ -10,7 +10,7 @@ fn safe_relative(path: &str) -> bool {
 pub(crate) fn local_documents(root: &str) -> Value {
     let mut docs = json!({"board":"","sheet":"","hasBoard":false,"hasSheet":false});
     if root.is_empty() { return docs }
-    let files = kicad::project::read(root);
+    let files = kicad::project::read_names(root);
     for (name, has, path) in [("board","hasBoard",files.pcb), ("sheet","hasSheet",files.sch)] {
         let abs = Path::new(&path);
         if let Some(rel) = abs.strip_prefix(root).ok().and_then(Path::to_str) {

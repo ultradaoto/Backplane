@@ -15,11 +15,19 @@ pub fn found(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            // (a project's folder holds thousands of files that are not projects: the name is borrowed, and only a folder's path or a
+            // .kicad_pro's is built, so a walk of a big tree allocates for the few it reports rather than for every file it passes)
+            let os = e.file_name();
+            let Some(name) = os.to_str() else { continue };
             let Ok(ft) = e.file_type() else { continue };
-            let p = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            if ft.is_dir() { if depth < 4 && !name.starts_with('.') && name != "node_modules" && !name.ends_with("-backups") { walk(&e.path(), &p, depth + 1, out) } }
-            else if name.ends_with(".kicad_pro") { out.push(p) } // find -type f/other: a link to a file is not -type d, so it prints too
+            if ft.is_dir() {
+                if depth < 4 && !name.starts_with('.') && name != "node_modules" && !name.ends_with("-backups") {
+                    let p = if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+                    walk(&e.path(), &p, depth + 1, out)
+                }
+            }
+            // find -type f/other: a link to a file is not -type d, so it prints too
+            else if name.ends_with(".kicad_pro") { out.push(if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") }) }
         }
     }
     let mut v = vec![]; walk(root, "", 1, &mut v);
@@ -47,11 +55,16 @@ pub fn altium_found(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            // (the borrowed name, and a path built only for what is reported: see found)
+            let os = e.file_name();
+            let Some(name) = os.to_str() else { continue };
             let Ok(ft) = e.file_type() else { continue };
-            let p = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            if ft.is_dir() { if depth < 4 && !name.starts_with('.') && name != "node_modules" && !name.starts_with("__") && !copies(&name.to_lowercase()) { walk(&e.path(), &p, depth + 1, out) } }
-            else if name.to_lowercase().ends_with(".prjpcb") { out.push(p) }
+            if ft.is_dir() {
+                if depth < 4 && !name.starts_with('.') && name != "node_modules" && !name.starts_with("__") && !copies(&name.to_lowercase()) {
+                    let p = if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+                    walk(&e.path(), &p, depth + 1, out)
+                }
+            } else if name.to_lowercase().ends_with(".prjpcb") { out.push(if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") }) }
         }
     }
     let mut v = vec![]; walk(root, "", 1, &mut v);
@@ -82,12 +95,21 @@ pub fn altium_cached(root: &str) -> bool {
     let v = !root.is_empty() && is_altium(&read(root)); m.lock().unwrap().insert(root.to_string(), (std::time::Instant::now(), v)); v
 }
 
-pub fn read(root: &str) -> Files {
+pub fn read(root: &str) -> Files { read_with(root, true) }
+
+/// The project's files as a picture draws them (its rail, its pages, its header): the same `pro`, `pcb` and `sch` as `read`, without searching the
+/// whole folder tree for every project file in it (`all`, which tells an agent about the others). A picture is made on every state change of the
+/// app, and a project with two thousand files four folders down cost a walk of all of them for every picture — where the project is named by
+/// `.backplane.json` or sits in the folder's root, the search answers nothing the picture reads.
+pub fn read_names(root: &str) -> Files { read_with(root, false) }
+
+fn read_with(root: &str, every: bool) -> Files {
     let cfg: serde_json::Value = std::fs::read_to_string(format!("{root}/.backplane.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(serde_json::Value::Null);
     let g = |k: &str| cfg.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let all = found(Path::new(root));
     let top = pick(&names(Path::new(root)), ".kicad_pro");
     let named_pro = g("project");
+    // the whole tree is searched only for the answer `read` gives every caller, and for a project no name and no root file points at
+    let all = if every || (named_pro.is_empty() && top.is_empty()) { found(Path::new(root)) } else { vec![] };
     // an Altium project: named, or the folder has no KiCad project (KiCad's wins when both are there)
     if named_pro.to_lowercase().ends_with(".prjpcb") { return altium(root, &named_pro, &g("pcb"), &g("schematic")) }
     if named_pro.is_empty() && top.is_empty() && all.is_empty() {
