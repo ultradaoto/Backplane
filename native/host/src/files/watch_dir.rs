@@ -24,7 +24,7 @@ pub fn poll() -> usize {
     let keys: Vec<(Key, u64)> = { let mut w = WATCHED.lock().unwrap(); w.retain(|_, v| v.0.elapsed() < KEEP); w.iter().map(|(k, v)| (k.clone(), v.1)).collect() };
     let mut changed = 0;
     for ((root, dir), sig) in keys {
-        let now = signature(&super::dir::list(Path::new(&root), &dir).unwrap_or_default());
+        let now = signature(&super::dir::list_now(Path::new(&root), &dir).unwrap_or_default());
         if now != sig { if let Some(e) = WATCHED.lock().unwrap().get_mut(&(root, dir)) { e.1 = now; changed += 1; } }
     }
     changed
