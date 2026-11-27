@@ -3889,6 +3889,9 @@ mod tests {
         let template: Value = serde_json::from_str::<Value>(include_str!("thread_static.json")).unwrap()["viewer"].clone();
         let mut s = sess(&th, json!({}));
         let o = view_action(&st, "h", &s, "gerbers").unwrap(); crate::session::patch::merge(&mut s, &o.patch);
+        // (the press names the set it found in the draft, and every picture after it draws that set; the discovery below is the page that names
+        // none - a restored session, or a phone that opens the Gerbers tab without a file)
+        crate::session::patch::merge(&mut s, &json!({"drafts": {format!("@view.file:{th}"): ""}}));
         let page = |s: &Value| viewer_json(&st, &template, s).expect("a picture");
         let first = page(&s)["key"].as_str().unwrap_or("").to_string();
         let named = |k: &str| std::path::Path::new(k).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -3906,6 +3909,12 @@ mod tests {
         std::fs::rename(d.join("mfg/b"), d.join("mfg/bb")).unwrap();
         let _ = page(&s)["key"].as_str().unwrap_or("").to_string();
         assert!(crate::files::kicad::gerber::walks() > again + 1, "the moved folder was looked at again");
+        // and a set that APPEARS is drawn: a new folder under mfg moves mfg's own time too, and the picture must name it
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::create_dir_all(d.join("mfg/z")).unwrap();
+        for k in 0..3 { std::fs::write(d.join("mfg/z").join(format!("l{k}.gbr")), "G04*").unwrap() }
+        let appeared = page(&s)["key"].as_str().unwrap_or("").to_string();
+        assert_eq!(named(&appeared), "z", "the set that appeared is drawn: {appeared}");
         let _ = std::fs::remove_dir_all(&d);
     }
     fn sess(th: &str, drafts: Value) -> Value { json!({"sel": th, "rid": 1, "drafts": drafts, "open": {}, "adding": false, "panel": false, "info": {}}) }
